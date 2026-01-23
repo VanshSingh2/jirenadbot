@@ -108,8 +108,8 @@ MESSAGES = {
     'account_last_name_tag': '',
     # Bio is forced to this text (removes any existing bio).
     'account_bio': '',
-    'support_link': os.getenv('SUPPORT_LINK', 'https://t.me/xxesr'),
-    'updates_link': os.getenv('UPDATES_LINK', 'https://t.me/xxesr'),
+    'support_link': os.getenv('SUPPORT_LINK', 'https://t.me/jirenog'),
+    'updates_link': os.getenv('UPDATES_LINK', 'https://t.me/jirenog'),
     'premium_contact': "Contact admin to purchase access.\n\nPaid Plan Benefits:\n- More accounts\n- Faster delays\n- Auto reply\n- Detailed logs\n- Priority support",
     
     # Privacy Policy
