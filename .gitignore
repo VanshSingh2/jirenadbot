@@ -1,0 +1,11 @@
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+**/session/
+*.session
+*.session-journal
+encryption.key
+GOKU ADS BOT/config.py
+.env
