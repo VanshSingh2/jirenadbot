@@ -42,6 +42,14 @@ import python_socks
 
 CONFIG = BOT_CONFIG
 
+# Default quiet hours for new users and users without a setting.
+DEFAULT_QUIET_HOURS = {
+    'enabled': True,
+    'start': '01:00',
+    'end': '07:00',
+    'label': '01:00-07:00',
+}
+
 # Helper function to get username from user ID
 async def get_username_from_id(client, user_id: int):
     """Fetch username from Telegram using user ID"""
@@ -154,6 +162,16 @@ def ensure_indexes():
         admins_col.create_index('user_id', unique=True)
     except Exception as e:
         print(f"[DB] Index creation failed: {e}")
+
+def ensure_user_defaults():
+    """Backfill defaults for existing users (quiet hours)."""
+    try:
+        users_col.update_many(
+            {'quiet_hours': {'$exists': False}},
+            {'$set': {'quiet_hours': DEFAULT_QUIET_HOURS}}
+        )
+    except Exception as e:
+        print(f"[DB] Default user settings update failed: {e}")
 
 # --- Session directory setup ---
 # Always store Telethon sqlite session files inside ./session/
@@ -506,6 +524,7 @@ def is_admin(user_id):
 def get_user(user_id):
     user = users_col.find_one({'user_id': int(user_id)})
     if not user:
+        quiet_default = DEFAULT_QUIET_HOURS.copy()
         user = {
             'user_id': int(user_id),
             'tier': 'free',
@@ -516,10 +535,18 @@ def get_user(user_id):
             'forwarding_mode': 'auto',  # Default: Auto Groups Only
             'ads_mode': 'saved',
             'smart_rotation': False,
+            'quiet_hours': quiet_default,
             'created_at': datetime.now(),
             '_is_new_user': True  # Flag for notification
         }
         users_col.insert_one(user)
+    elif not user.get('quiet_hours'):
+        quiet_default = DEFAULT_QUIET_HOURS.copy()
+        users_col.update_one(
+            {'user_id': int(user_id)},
+            {'$set': {'quiet_hours': quiet_default}}
+        )
+        user['quiet_hours'] = quiet_default
     return user
 
 def is_premium(user_id):
@@ -9084,6 +9111,7 @@ async def main():
     
     try:
         ensure_indexes()
+        ensure_user_defaults()
         await main_bot.start(bot_token=CONFIG['bot_token'])
         me = await main_bot.get_me()
         print(f"Main: @{me.username}")
