@@ -379,3 +379,24 @@ Remaining per-render reads (`get_user_accounts`, some `count_documents`) are now
 the long pole; they can be cached/offloaded next if a very large UI still lags,
 but with `get_user` cached + the thread pool, UI stays responsive into the
 thousands-of-users range.
+
+
+
+## Self-hosted MongoDB (docker-compose)
+
+`docker-compose.yml` now includes a `mongo` service so you can self-host instead
+of paying for Atlas:
+
+1. In `.env` set `MONGO_ROOT_USER` / `MONGO_ROOT_PASS` and
+   `MONGO_URI=mongodb://USER:PASS@mongo:27017/gokuads_db?authSource=admin`.
+2. `docker compose up -d --build`.
+
+Notes:
+- Mongo has **no published `ports:`** → reachable only on the private compose
+  network (never exposed to the internet). Auth is enabled via the root creds.
+- Data persists in the `mongo_data` named volume; cache is capped via
+  `MONGO_CACHE_GB` (default 1.5) so it won't eat all the box's RAM.
+- The client only enables TLS for Atlas (`mongodb+srv`) or `tls=true` URIs;
+  local `mongodb://` connects without TLS (pymongo would otherwise error).
+- Sizing: 2 GB is plenty for ≤500 accounts; 4 GB for a few thousand (this bot's
+  dataset is tens of MB). Use SSD; back up the volume.

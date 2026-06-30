@@ -1,22 +1,45 @@
-# Single-box deployment. `manager.py` runs the UI bot + auto-scaled workers
-# inside this one container; `restart: unless-stopped` covers process/host crashes.
+# Single-box deployment with a SELF-HOSTED MongoDB.
+# `manager.py` runs the UI bot + auto-scaled workers; `mongo` is your own DB.
+# Both restart automatically; Mongo data persists in a named volume.
 #
 # Before first run:
 #   1) cp .env.example .env  and fill in real values (rotate the leaked tokens!)
-#   2) set ENCRYPTION_KEY in .env to a STABLE Fernet key (generate once:
-#        python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())")
-#      Keep it constant forever — changing it makes existing saved sessions undecryptable.
+#   2) set ENCRYPTION_KEY to a STABLE Fernet key (generate once):
+#        python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"
+#   3) set MONGO_ROOT_USER / MONGO_ROOT_PASS (any strong values), and point the bot at it:
+#        MONGO_URI=mongodb://USER:PASS@mongo:27017/gokuads_db?authSource=admin
+#        MONGO_DB_NAME=gokuads_db
+#   then:  docker compose up -d --build
 #
-# To scale across machines later: run one container with BOT_ROLE=bot, and N
-# containers with BOT_ROLE=worker / WORKER_ID / WORKER_COUNT (one per box/IP set),
-# instead of the all-in-one manager.
+# Security: Mongo is NOT published to the host (no `ports:`), so it's only
+# reachable on the private compose network — never exposed to the internet.
 
 services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    # Cap WiredTiger cache so Mongo doesn't eat all RAM on a shared box.
+    command: ["--wiredTigerCacheSizeGB", "${MONGO_CACHE_GB:-1.5}", "--bind_ip_all"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASS}
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # No `ports:` on purpose — keep Mongo private to the compose network.
+
   jirenadbot:
     build: .
     image: jirenadbot:latest
     restart: unless-stopped
     env_file: .env
+    depends_on:
+      mongo:
+        condition: service_healthy
     volumes:
       - ./session:/app/session        # persist Telegram sessions
     stop_grace_period: 30s
@@ -26,3 +49,6 @@ services:
     #     limits:
     #       cpus: "4"
     #       memory: 8g
+
+volumes:
+  mongo_data:

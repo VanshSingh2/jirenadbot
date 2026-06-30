@@ -134,10 +134,8 @@ else:
 cipher_suite = Fernet(key.encode())
 
 allow_invalid_tls = os.getenv('MONGO_TLS_INSECURE', '').strip().lower() in ('1', 'true', 'yes')
-mongo_client = MongoClient(
-    CONFIG['mongo_uri'],
-    tlsCAFile=certifi.where(),
-    tlsAllowInvalidCertificates=allow_invalid_tls,
+_mongo_uri = CONFIG['mongo_uri']
+_mongo_kwargs = dict(
     # ---- Connection pool / timeout tuning (scales to many concurrent accounts) ----
     # The bot uses a synchronous driver shared by many forwarding tasks. A bounded,
     # reused pool prevents connection storms and the timeouts stop a slow Atlas
@@ -154,6 +152,13 @@ mongo_client = MongoClient(
     retryReads=True,
     appname='jirenadbot',
 )
+# Only enable TLS for Atlas (srv) or when explicitly requested. Self-hosted/local
+# Mongo (mongodb://...) connects WITHOUT TLS — pymongo errors if TLS options are
+# passed while TLS is disabled, so only add them when actually needed.
+if _mongo_uri.startswith('mongodb+srv://') or 'tls=true' in _mongo_uri.lower() or 'ssl=true' in _mongo_uri.lower():
+    _mongo_kwargs['tlsCAFile'] = certifi.where()
+    _mongo_kwargs['tlsAllowInvalidCertificates'] = allow_invalid_tls
+mongo_client = MongoClient(_mongo_uri, **_mongo_kwargs)
 db = mongo_client[CONFIG['db_name']]
 
 users_col = db['users']

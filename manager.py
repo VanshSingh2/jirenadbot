@@ -113,7 +113,11 @@ OWNER_ID = int(os.getenv('OWNER_ID') or BOT_CONFIG.get('owner_id') or 0)
 MONGO_URI = os.getenv('MONGO_URI') or BOT_CONFIG.get('mongo_uri')
 DB_NAME = os.getenv('MONGO_DB_NAME') or BOT_CONFIG.get('db_name')
 
-_mongo = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=8000)
+_use_tls = MONGO_URI.startswith('mongodb+srv://') or 'tls=true' in MONGO_URI.lower() or 'ssl=true' in MONGO_URI.lower()
+if _use_tls:
+    _mongo = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=8000)
+else:
+    _mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
 _db = _mongo[DB_NAME]
 _accounts = _db['accounts']
 _health = _db['worker_health']
