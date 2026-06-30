@@ -161,6 +161,7 @@ account_flood_waits_col = db['account_flood_waits']
 logger_tokens_col = db['logger_tokens']
 admins_col = db['admins']
 settings_col = db['bot_settings']
+worker_health_col = db['worker_health']
 
 # ---- Global, admin-controlled settings (e.g. the per-group send frequency) ----
 # Frequency is a GLOBAL policy: default 3 sends/hour per group, hard-capped at 3.
@@ -1604,6 +1605,7 @@ async def run_forwarding_loop(user_id, account_id):
                         await client.connect()
                         print(f"[FORWARDING] Reconnected account {account_id}")
                     except Exception as e:
+                        _health_bump('timeouts')
                         print(f"[FORWARDING] Reconnect failed {account_id}: {str(e)[:80]}; retrying")
                         await asyncio.sleep(15)
                         continue
@@ -2009,6 +2011,7 @@ async def run_forwarding_loop(user_id, account_id):
                         wait_time = e.seconds
                         failed += 1
                         set_flood_wait(account_id, group_key, group['title'], wait_time)
+                        _health_bump('floods')
                         print(f"[FORWARDING] FloodWait {wait_time // 60}m for {group['title']} - will skip until expires")
                         await add_user_log(user_id, f"FloodWait {wait_time // 60}m in {group['title'][:20]}")
                         
@@ -2045,6 +2048,7 @@ async def run_forwarding_loop(user_id, account_id):
                         # than risk an account ban.
                         failed += 1
                         peerflood_hit = True
+                        _health_bump('peerfloods')
                         print(f"[FORWARDING] PeerFlood for account {account_id} - cooling down")
                         await add_user_log(user_id, "PeerFlood detected - pausing this account to stay safe")
                         try:
@@ -2093,6 +2097,8 @@ async def run_forwarding_loop(user_id, account_id):
                 # Flush accumulated stats once per round (1 write instead of N).
                 if sent or stats_failed:
                     update_account_stats(str(account_id), sent=sent, failed=stats_failed)
+                _health_bump('sends', sent)
+                _health_bump('fails', stats_failed)
                 
                 print(f"[FORWARDING] Round complete. Sent: {sent}, Failed: {failed}, Skipped: {skipped}")
                 try:
@@ -2126,6 +2132,7 @@ async def run_forwarding_loop(user_id, account_id):
                 # Transient network / Telegram connection timeout: keep the client,
                 # back off briefly and retry next round (auto_reconnect + the round-start
                 # check recover the link) instead of tearing the whole loop down.
+                _health_bump('timeouts')
                 print(f"[FORWARDING] Connection issue for {account_id}: {type(e).__name__}: {str(e)[:80]} - retrying")
                 await asyncio.sleep(15)
                 continue
@@ -2329,6 +2336,49 @@ async def health_logger():
             raise
         except Exception as e:
             print(f"[HEALTH] {e}")
+
+
+# Per-process health counters (reset each reporting window). Used by the manager
+# to adapt accounts/worker when timeouts/flood spike.
+_HEALTH = {'sends': 0, 'fails': 0, 'floods': 0, 'peerfloods': 0, 'timeouts': 0}
+
+
+def _health_bump(key, n=1):
+    try:
+        _HEALTH[key] = _HEALTH.get(key, 0) + n
+    except Exception:
+        pass
+
+
+async def health_reporter():
+    """Write a per-worker health snapshot to Mongo so the manager can adapt the
+    per-worker cap (e.g. shrink it when connection timeouts spike, alert on flood)."""
+    interval = int(os.getenv('HEALTH_REPORT_INTERVAL', '30'))
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            window = dict(_HEALTH)
+            for k in _HEALTH:
+                _HEALTH[k] = 0
+            active_local = sum(1 for t in forwarding_tasks.values() if not t.done())
+            doc = {
+                'worker_id': WORKER_ID,
+                'role': BOT_ROLE,
+                'updated_at': datetime.now(),
+                'active_accounts': active_local,
+                'window_seconds': interval,
+                'sends': window.get('sends', 0),
+                'fails': window.get('fails', 0),
+                'floods': window.get('floods', 0),
+                'peerfloods': window.get('peerfloods', 0),
+                'timeouts': window.get('timeouts', 0),
+            }
+            await db_call(lambda: worker_health_col.update_one(
+                {'worker_id': WORKER_ID}, {'$set': doc}, upsert=True))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[HEALTH] reporter error: {e}")
 
 
 async def forward_message(client, to_entity, msg_id, from_peer, topic_id=None):
@@ -9374,6 +9424,7 @@ async def main():
     if do_forwarding:
         asyncio.create_task(forwarding_reconciler())
         asyncio.create_task(health_logger())
+        asyncio.create_task(health_reporter())
 
     print("="*50)
     print("Bot running!")

@@ -280,3 +280,25 @@ The manager auto-sizes `MAX_ACCOUNTS_PER_WORKER` from the machine:
 - Examples: 8 GB / 4-core → ~100; 4 GB / 2-core → ~100; a constrained box →
   auto-lowers (e.g., 31). Set `AUTO_WORKER_CAP=0` + `MAX_ACCOUNTS_PER_WORKER=N`
   to force a fixed value. The boot log prints the machine specs and chosen cap.
+
+
+
+## Health-adaptive scaling (manager reacts to runtime errors)
+
+Workers write a health snapshot to `worker_health` every `HEALTH_REPORT_INTERVAL`
+(sends, fails, FloodWait, PeerFlood, connection timeouts). The manager reads the
+aggregate each cycle and adapts — distinguishing two very different problems:
+
+- **Connection/loop stress** (timeouts/op ≥ `STRESS_TIMEOUT_RATE`, sustained for
+  `STRESS_CYCLES`): the event loop is overloaded → **shrink accounts/worker**
+  (`CAP_STEP_DOWN`), which makes the manager spawn more workers and lighten each
+  loop. When calm for `RECOVER_CYCLES`, it grows the cap back toward baseline
+  (`CAP_STEP_UP`). Changes are rate-limited by `CAP_CHANGE_COOLDOWN` to avoid
+  restart thrash, and the worker pool restarts to apply the new cap.
+- **Telegram flood** (FloodWait/PeerFlood rate ≥ `FLOOD_ALERT_RATE`): this is an
+  account/IP limit — more workers can't fix it. The manager **alerts the admin**
+  to add proxies or lower `/freq`, and does NOT churn workers for it.
+
+So the manager now adjusts BOTH levers automatically: worker count (by account
+load) and accounts-per-worker (by connection health), while flagging flood for
+human action (proxies). All thresholds are env-tunable.

@@ -28,6 +28,7 @@ import time
 import math
 import signal
 import subprocess
+from datetime import datetime, timedelta
 
 try:
     from dotenv import load_dotenv
@@ -92,6 +93,21 @@ PROXY_ALERT_INTERVAL = int(os.getenv('PROXY_ALERT_INTERVAL', '3600'))
 # Warn when we cross this fraction of current proxy capacity.
 PROXY_WARN_FILL = float(os.getenv('PROXY_WARN_FILL', '0.85'))
 
+# ---- Health-adaptive per-worker cap ----
+# Workers report sends/fails/floods/timeouts to Mongo. The manager shrinks the
+# per-worker cap (=> more workers, fewer accounts each) when CONNECTION stress is
+# high (loop overloaded), and recovers it when calm. Telegram FLOOD is handled by
+# alerting (add proxies / lower frequency) since more workers won't fix it.
+STRESS_TIMEOUT_RATE = float(os.getenv('STRESS_TIMEOUT_RATE', '0.05'))  # timeouts/op to call it stressed
+FLOOD_ALERT_RATE = float(os.getenv('FLOOD_ALERT_RATE', '0.10'))        # (floods+peerfloods)/sends to alert
+MIN_OPS_FOR_SIGNAL = int(os.getenv('MIN_OPS_FOR_SIGNAL', '50'))        # ignore tiny samples
+CAP_STEP_DOWN = float(os.getenv('CAP_STEP_DOWN', '0.8'))               # shrink to 80% under stress
+CAP_STEP_UP = float(os.getenv('CAP_STEP_UP', '1.15'))                 # grow 15% when healthy
+STRESS_CYCLES = int(os.getenv('STRESS_CYCLES', '2'))                   # stressed cycles before shrinking
+RECOVER_CYCLES = int(os.getenv('RECOVER_CYCLES', '10'))               # calm cycles before growing
+CAP_CHANGE_COOLDOWN = int(os.getenv('CAP_CHANGE_COOLDOWN', '600'))     # min seconds between cap changes
+HEALTH_STALE_SECONDS = int(os.getenv('HEALTH_STALE_SECONDS', '120'))   # ignore health older than this
+
 BOT_TOKEN = os.getenv('BOT_TOKEN') or BOT_CONFIG.get('bot_token')
 OWNER_ID = int(os.getenv('OWNER_ID') or BOT_CONFIG.get('owner_id') or 0)
 MONGO_URI = os.getenv('MONGO_URI') or BOT_CONFIG.get('mongo_uri')
@@ -100,11 +116,17 @@ DB_NAME = os.getenv('MONGO_DB_NAME') or BOT_CONFIG.get('db_name')
 _mongo = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=8000)
 _db = _mongo[DB_NAME]
 _accounts = _db['accounts']
+_health = _db['worker_health']
 
 # {worker_id: Popen}, plus the UI bot under key 'bot'
 _procs = {}
 _running_worker_count = 0     # WORKER_COUNT the live workers were started with
 _down_counter = 0
+_effective_cap = MAX_ACCOUNTS_PER_WORKER   # adaptive; starts at the configured/auto baseline
+_stress_count = 0
+_healthy_count = 0
+_last_cap_change = 0.0
+_last_flood_alert = 0.0
 _last_proxy_alert = 0.0
 _last_proxy_alert_needed = 0
 _stop = False
@@ -146,7 +168,8 @@ def _spawn(role, worker_id=None, worker_count=None):
     if role == 'worker':
         env['WORKER_ID'] = str(worker_id)
         env['WORKER_COUNT'] = str(worker_count)
-        env['MAX_ACCOUNTS_PER_WORKER'] = str(MAX_ACCOUNTS_PER_WORKER)
+        env['MAX_ACCOUNTS_PER_WORKER'] = str(_effective_cap)
+        env['AUTO_WORKER_CAP'] = '0'  # manager already decided the cap
     here = os.path.dirname(os.path.abspath(__file__))
     p = subprocess.Popen([sys.executable, os.path.join(here, 'bot.py')], env=env)
     label = role if role == 'bot' else f"worker {worker_id}/{worker_count}"
@@ -198,8 +221,85 @@ def _respawn_dead_workers():
 
 
 def _desired_workers(active):
-    raw = math.ceil(active / MAX_ACCOUNTS_PER_WORKER) if active > 0 else MIN_WORKERS
+    raw = math.ceil(active / _effective_cap) if active > 0 else MIN_WORKERS
     return max(MIN_WORKERS, min(MAX_WORKERS, raw))
+
+
+def _read_health():
+    """Aggregate recent per-worker health docs from Mongo."""
+    agg = {'sends': 0, 'fails': 0, 'floods': 0, 'peerfloods': 0, 'timeouts': 0}
+    try:
+        cutoff = datetime.now() - timedelta(seconds=HEALTH_STALE_SECONDS)
+        for d in _health.find({'updated_at': {'$gte': cutoff}}):
+            for k in agg:
+                agg[k] += int(d.get(k, 0) or 0)
+    except Exception as e:
+        print(f"[MANAGER] health read failed: {e}")
+    return agg
+
+
+def _adapt_cap():
+    """Adjust the effective per-worker cap from worker health.
+    Returns True if the cap changed (caller should re-scale the pool)."""
+    global _effective_cap, _stress_count, _healthy_count, _last_cap_change, _last_flood_alert
+    agg = _read_health()
+    ops = agg['sends'] + agg['fails']
+    if ops < MIN_OPS_FOR_SIGNAL:
+        return False  # not enough activity to judge
+
+    timeout_rate = agg['timeouts'] / max(1, ops)
+    flood_total = agg['floods'] + agg['peerfloods']
+    flood_rate = flood_total / max(1, agg['sends'])
+    now = time.time()
+
+    # Telegram flood -> alert only (more workers won't help; needs proxies/slower).
+    if flood_rate >= FLOOD_ALERT_RATE and (now - _last_flood_alert) >= PROXY_ALERT_INTERVAL:
+        _last_flood_alert = now
+        alert_admin(
+            "⚠️ Jiren Ads Bot — high Telegram flood rate\n\n"
+            f"~{flood_rate*100:.0f}% of sends hit FloodWait/PeerFlood in the last window.\n"
+            "➡️ Add more proxies/IPs and/or lower the send frequency (/freq). "
+            "Adding workers will NOT fix account-level flood limits."
+        )
+        print(f"[MANAGER] flood alert (rate={flood_rate:.2f})")
+
+    # Connection stress -> shrink cap (=> more workers, lighter loops).
+    if timeout_rate >= STRESS_TIMEOUT_RATE:
+        _stress_count += 1
+        _healthy_count = 0
+    elif timeout_rate < STRESS_TIMEOUT_RATE / 2:
+        _healthy_count += 1
+        _stress_count = 0
+    else:
+        _stress_count = 0  # neutral zone
+
+    if (now - _last_cap_change) < CAP_CHANGE_COOLDOWN:
+        return False
+
+    if _stress_count >= STRESS_CYCLES and _effective_cap > WORKER_CAP_MIN:
+        new_cap = max(WORKER_CAP_MIN, int(_effective_cap * CAP_STEP_DOWN))
+        if new_cap < _effective_cap:
+            old = _effective_cap
+            _effective_cap = new_cap
+            _last_cap_change = now
+            _stress_count = 0
+            print(f"[MANAGER] CONNECTION STRESS (timeouts {timeout_rate*100:.0f}%): "
+                  f"cap {old} -> {new_cap} (spreading accounts thinner)")
+            alert_admin(f"⚙️ Auto-tuned: connection timeouts high (~{timeout_rate*100:.0f}%). "
+                        f"Reduced accounts/worker {old}→{new_cap} and adding workers.")
+            return True
+
+    if _healthy_count >= RECOVER_CYCLES and _effective_cap < MAX_ACCOUNTS_PER_WORKER:
+        new_cap = min(MAX_ACCOUNTS_PER_WORKER, int(_effective_cap * CAP_STEP_UP) + 1)
+        if new_cap > _effective_cap:
+            old = _effective_cap
+            _effective_cap = new_cap
+            _last_cap_change = now
+            _healthy_count = 0
+            print(f"[MANAGER] Healthy: cap {old} -> {new_cap} (consolidating)")
+            return True
+
+    return False
 
 
 def _check_proxies(active):
@@ -273,9 +373,19 @@ def main():
             _respawn_dead_workers()
 
             active = _safe_count()
+
+            # Health-adaptive: shrink/grow accounts-per-worker from runtime errors.
+            cap_changed = _adapt_cap()
+
             desired = _desired_workers(active)
 
-            if desired > _running_worker_count:
+            if cap_changed:
+                # Cap changed -> restart pool so workers pick up the new cap (and
+                # the worker count that matches it).
+                print(f"[MANAGER] Re-scaling for new cap={_effective_cap} -> {desired} workers")
+                _set_worker_count(desired)
+                _down_counter = 0
+            elif desired > _running_worker_count:
                 print(f"[MANAGER] Scaling UP {_running_worker_count} -> {desired} (active={active})")
                 _set_worker_count(desired)
                 _down_counter = 0
