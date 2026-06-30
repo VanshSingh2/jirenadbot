@@ -1629,15 +1629,14 @@ async def run_forwarding_loop(user_id, account_id):
                     try:
                         await event.reply(reply_text)
                         
-                        # Track auto-reply in stats
-                        try:
-                            account_stats_col.update_one(
-                                {'account_id': str(account_id)},
-                                {'$inc': {'auto_replies': 1}},
-                                upsert=True
-                            )
-                        except Exception:
-                            pass
+                        # Track auto-reply in stats (fire-and-forget; never block the
+                        # reply path / worker loop on a DB write).
+                        asyncio.create_task(db_call(
+                            account_stats_col.update_one,
+                            {'account_id': str(account_id)},
+                            {'$inc': {'auto_replies': 1}},
+                            upsert=True
+                        ))
                         
                         print(f"[AUTO-REPLY] Replied to {event.sender_id} with: {reply_text[:30]}...")
                     except Exception as e:
@@ -4449,7 +4448,6 @@ async def callback(event):
                 return
             
             # Grant premium with plan name
-            plan_name = plan_id.replace('plan_', '').capitalize()
             set_user_premium(target_uid, plan['max_accounts'], plan_name)
             
             # Notify target user with plan-specific image
