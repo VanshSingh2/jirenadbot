@@ -9218,6 +9218,10 @@ async def notify_account_added(user_id, username, phone, account_phone, plan_nam
         traceback.print_exc()
 
 # Notification callback handlers
+# Notifications are sent by notification_bot, so its button taps arrive on
+# notification_bot — register the handler there. (Also on main_bot in case any
+# alert is ever DM'd via the main bot.)
+@notification_bot.on(events.CallbackQuery(pattern=b"^notif_"))
 @main_bot.on(events.CallbackQuery(pattern=b"^notif_"))
 async def handle_notification_actions(event):
     """Handle notification inline button actions"""
