@@ -6,6 +6,7 @@ import random
 import string
 import re
 import hashlib
+import concurrent.futures
 from datetime import datetime, timedelta
 from telethon import TelegramClient, Button, events
 from telethon.sessions import StringSession
@@ -85,7 +86,7 @@ async def resolve_target_user_id(raw: str, client):
         entity = await client.get_entity(username)
         target_id = int(entity.id)
         if getattr(entity, 'username', None):
-            users_col.update_one(
+            uupdate(
                 {'user_id': target_id},
                 {'$set': {'username': entity.username}},
                 upsert=True
@@ -632,6 +633,20 @@ def invalidate_logs_cache():
         _logs_chat_cache.clear()
 
 
+def uupdate(flt, update, *args, **kwargs):
+    """users_col.update_one wrapper that auto-invalidates the user cache. ALL user
+    writes go through this so cached get_user() reads are never stale after a write
+    (toggles/settings reflect immediately)."""
+    res = users_col.update_one(flt, update, *args, **kwargs)
+    try:
+        uid = flt.get('user_id') if isinstance(flt, dict) else None
+        if uid is not None:
+            invalidate_user_cache(uid)
+    except Exception:
+        pass
+    return res
+
+
 async def db_call(func, *args, **kwargs):
     """Run a blocking (pymongo) callable in a worker thread so it never freezes
     the event loop. Use this for DB work inside hot async paths; if Atlas is slow
@@ -662,32 +677,40 @@ def is_admin(user_id):
     return result
 
 def get_user(user_id):
-    user = users_col.find_one({'user_id': int(user_id)})
+    uid = int(user_id)
+    now = time.monotonic()
+    # Cache hit: UI renders call get_user several times per tap; caching collapses
+    # those to one DB read per USER_CACHE_TTL. Writes go through uupdate() which
+    # invalidates this cache, so reads are never stale after a write.
+    with _cache_lock:
+        hit = _user_cache.get(uid)
+        if hit and hit[0] > now:
+            return dict(hit[1])
+    user = users_col.find_one({'user_id': uid})
     if not user:
         quiet_default = DEFAULT_QUIET_HOURS.copy()
         user = {
-            'user_id': int(user_id),
+            'user_id': uid,
             'tier': 'free',
             'max_accounts': FREE_TIER['max_accounts'],
             'approved': False,
-            'autoreply_enabled': False,  # Default OFF
-            'interval_preset': 'fast',  # Default: Risky (10s/120s)
-            'forwarding_mode': 'auto',  # Default: Auto Groups Only
+            'autoreply_enabled': False,
+            'interval_preset': 'fast',
+            'forwarding_mode': 'auto',
             'ads_mode': 'saved',
             'smart_rotation': False,
             'quiet_hours': quiet_default,
             'created_at': datetime.now(),
-            '_is_new_user': True  # Flag for notification
+            '_is_new_user': True
         }
         users_col.insert_one(user)
     elif not user.get('quiet_hours'):
         quiet_default = DEFAULT_QUIET_HOURS.copy()
-        users_col.update_one(
-            {'user_id': int(user_id)},
-            {'$set': {'quiet_hours': quiet_default}}
-        )
+        uupdate({'user_id': uid}, {'$set': {'quiet_hours': quiet_default}})
         user['quiet_hours'] = quiet_default
-    return user
+    with _cache_lock:
+        _user_cache[uid] = (now + _USER_CACHE_TTL, user)
+    return dict(user)
 
 def get_user_cached(user_id):
     """Short-TTL cached read of get_user for hot paths (forwarding loop + derived
@@ -823,7 +846,7 @@ def is_approved(user_id):
     return user.get('approved', False)
 
 def approve_user(user_id):
-    users_col.update_one(
+    uupdate(
         {'user_id': int(user_id)},
         {'$set': {'approved': True, 'approved_at': datetime.now()}},
         upsert=True
@@ -838,7 +861,7 @@ def set_user_premium(user_id, max_accounts, plan_name='premium'):
     plan_key = normalize_plan_key(plan_name) or 'grow'
     plan_label = get_plan_label(plan_key)
     
-    users_col.update_one(
+    uupdate(
         {'user_id': int(user_id)},
         {'$set': {
             'tier': 'premium',
@@ -856,7 +879,7 @@ def set_user_premium(user_id, max_accounts, plan_name='premium'):
 
 def remove_user_premium(user_id):
     """Downgrade user to free and clear premium-related fields."""
-    users_col.update_one(
+    uupdate(
         {'user_id': int(user_id)},
         {'$set': {
             'tier': 'free',
@@ -3314,7 +3337,7 @@ async def cmd_start(event):
                     getattr(sender, 'phone', None)
                 ))
                 # Remove flag
-                users_col.update_one({'user_id': int(uid)}, {'$unset': {'_is_new_user': ''}})
+                uupdate({'user_id': int(uid)}, {'$unset': {'_is_new_user': ''}})
             except Exception as e:
                 print(f"[NOTIFICATION] Error sending new user notification: {e}")
 
@@ -3397,7 +3420,7 @@ async def cmd_ban(event):
     reason = event.pattern_match.group(2).strip()
     
     # Ban the user
-    users_col.update_one(
+    uupdate(
         {'user_id': target_id},
         {'$set': {
             'banned': True,
@@ -3620,7 +3643,7 @@ async def cmd_logmode(event):
         return
 
     until = datetime.now() + timedelta(minutes=2)
-    users_col.update_one(
+    uupdate(
         {'user_id': uid},
         {'$set': {'logmode_until': until, 'logmode_last_used': today}},
         upsert=True
@@ -4766,7 +4789,7 @@ async def callback(event):
             target_id = int(data.split("_")[1])
             
             # Unban the user
-            users_col.update_one(
+            uupdate(
                 {'user_id': target_id},
                 {'$set': {
                     'banned': False,
@@ -4834,7 +4857,7 @@ async def callback(event):
                 accounts_deleted += 1
             
             # Reset user to free plan
-            users_col.update_one(
+            uupdate(
                 {'user_id': target_id},
                 {'$set': {
                     'tier': 'free',
@@ -5175,7 +5198,7 @@ async def callback(event):
             # Handle preset intervals (slow, medium, fast) - available to all plans
             preset_key = data.replace("interval_", "")
             if preset_key in INTERVAL_PRESETS:
-                users_col.update_one({'user_id': uid}, {'$set': {'interval_preset': preset_key}})
+                uupdate({'user_id': uid}, {'$set': {'interval_preset': preset_key}})
                 preset = INTERVAL_PRESETS[preset_key]
                 preset_name = preset_key.capitalize()
                 await event.answer(f"Interval set to: {preset_name}", alert=True)
@@ -5471,7 +5494,7 @@ async def callback(event):
 
             start, end = preset_map[data]
             label = f"{start}-{end}"
-            users_col.update_one(
+            uupdate(
                 {'user_id': int(uid)},
                 {'$set': {'quiet_hours': {'enabled': True, 'start': start, 'end': end, 'label': label}}},
                 upsert=True
@@ -5504,7 +5527,7 @@ async def callback(event):
             user_doc = get_user(uid)
             current = user_doc.get('auto_leave_groups', True)
             new_value = not current
-            users_col.update_one({'user_id': int(uid)}, {'$set': {'auto_leave_groups': new_value}}, upsert=True)
+            uupdate({'user_id': int(uid)}, {'$set': {'auto_leave_groups': new_value}}, upsert=True)
             
             status = "enabled" if new_value else "disabled"
             await event.answer(f"Auto Leave Failed {status}!", alert=True)
@@ -5630,7 +5653,7 @@ async def callback(event):
             user = get_user(uid)
             enabled = user.get('autoreply_enabled', True)
             new_value = not enabled
-            users_col.update_one({'user_id': int(uid)}, {'$set': {'autoreply_enabled': new_value}})
+            uupdate({'user_id': int(uid)}, {'$set': {'autoreply_enabled': new_value}})
 
             try:
                 await event.answer(f"Auto Reply {'enabled' if new_value else 'disabled'}", alert=False)
@@ -5771,13 +5794,13 @@ async def callback(event):
             return
 
         if data == "ads_mode_saved":
-            users_col.update_one({'user_id': uid}, {'$set': {'ads_mode': 'saved'}}, upsert=True)
+            uupdate({'user_id': uid}, {'$set': {'ads_mode': 'saved'}}, upsert=True)
             await event.answer("Ads Mode set: Saved Message", alert=True)
             await event.edit("<b>✅ Ads Mode Updated</b>\n\nNow bot will use each account's <b>Saved Messages</b> for forwarding.", parse_mode='html', buttons=[[Button.inline("← Back", b"menu_ads_mode")]])
             return
 
         if data == "ads_mode_custom":
-            users_col.update_one({'user_id': uid}, {'$set': {'ads_mode': 'custom'}}, upsert=True)
+            uupdate({'user_id': uid}, {'$set': {'ads_mode': 'custom'}}, upsert=True)
             cur = (get_user(uid).get('ads_custom_message') or '').strip()
             preview = _h(cur[:500]) if cur else '<i>Not set</i>'
             text = (
@@ -5809,7 +5832,7 @@ async def callback(event):
             return
 
         if data == "ads_mode_post":
-            users_col.update_one({'user_id': uid}, {'$set': {'ads_mode': 'post'}}, upsert=True)
+            uupdate({'user_id': uid}, {'$set': {'ads_mode': 'post'}}, upsert=True)
             cur = (get_user(uid).get('ads_post_link') or '').strip()
             preview = _h(cur) if cur else '<i>Not set</i>'
             await event.edit(
@@ -5887,7 +5910,7 @@ async def callback(event):
             new_val = not current
             
             # Save to users collection
-            users_col.update_one(
+            uupdate(
                 {"user_id": uid},
                 {"$set": {"smart_rotation": new_val}},
                 upsert=True
@@ -5937,7 +5960,7 @@ async def callback(event):
 
         if data == "logs_enable_global":
             # Enable logs globally for user (applies to all accounts)
-            users_col.update_one({'user_id': int(uid)}, {'$set': {'logs_chat_id': int(uid)}}, upsert=True)
+            uupdate({'user_id': int(uid)}, {'$set': {'logs_chat_id': int(uid)}}, upsert=True)
             invalidate_logs_cache()
             await event.answer("Logs enabled", alert=True)
             await event.edit(
@@ -5948,7 +5971,7 @@ async def callback(event):
             return
 
         if data == "logs_disable_global":
-            users_col.update_one({'user_id': int(uid)}, {'$unset': {'logs_chat_id': ""}})
+            uupdate({'user_id': int(uid)}, {'$unset': {'logs_chat_id': ""}})
             invalidate_logs_cache()
             await event.answer("Logs disabled", alert=True)
             await event.edit(
@@ -5994,7 +6017,7 @@ async def callback(event):
         
         if data.startswith("set_fwd_mode_"):
             mode = data.replace("set_fwd_mode_", "")
-            users_col.update_one({'user_id': uid}, {'$set': {'forwarding_mode': mode}})
+            uupdate({'user_id': uid}, {'$set': {'forwarding_mode': mode}})
             modes = {
                 'topics': 'Forward to Topics Only',
                 'auto': 'Forward to Groups Only',
@@ -6217,7 +6240,7 @@ async def callback(event):
                     username = await get_username_from_id(event.client, user_id)
                     if username:
                         # Update database with fetched username
-                        users_col.update_one({'user_id': user_id}, {'$set': {'username': username}})
+                        uupdate({'user_id': user_id}, {'$set': {'username': username}})
                 
                 # Add to display list
                 if username:
@@ -6265,7 +6288,7 @@ async def callback(event):
                     username = await get_username_from_id(event.client, user_id)
                     if username:
                         # Update database with fetched username
-                        users_col.update_one({'user_id': user_id}, {'$set': {'username': username}})
+                        uupdate({'user_id': user_id}, {'$set': {'username': username}})
                 
                 # Add to display list
                 if username:
@@ -6447,7 +6470,7 @@ async def callback(event):
             target_id = int(parts[0])
             mode = parts[1] if len(parts) > 1 else "auto"
             source = parts[2] if len(parts) > 2 else "premium"
-            users_col.update_one({'user_id': target_id}, {'$set': {'forwarding_mode': mode}}, upsert=True)
+            uupdate({'user_id': target_id}, {'$set': {'forwarding_mode': mode}}, upsert=True)
             await event.answer("Mode updated", alert=True)
             text, buttons = admin_mode_menu(target_id, source)
             await event.edit(text, parse_mode='html', buttons=buttons)
@@ -6461,7 +6484,7 @@ async def callback(event):
             target_id = int(parts[0])
             preset = parts[1] if len(parts) > 1 else "medium"
             source = parts[2] if len(parts) > 2 else "premium"
-            users_col.update_one({'user_id': target_id}, {'$set': {'interval_preset': preset}}, upsert=True)
+            uupdate({'user_id': target_id}, {'$set': {'interval_preset': preset}}, upsert=True)
             await event.answer("Intervals updated", alert=True)
             text, buttons = admin_interval_menu(target_id, source)
             await event.edit(text, parse_mode='html', buttons=buttons)
@@ -6492,7 +6515,7 @@ async def callback(event):
             target_id = int(parts[0])
             mode = parts[1] if len(parts) > 1 else "saved"
             source = parts[2] if len(parts) > 2 else "premium"
-            users_col.update_one({'user_id': target_id}, {'$set': {'ads_mode': mode}}, upsert=True)
+            uupdate({'user_id': target_id}, {'$set': {'ads_mode': mode}}, upsert=True)
             await event.answer("Ads mode updated", alert=True)
             text, buttons = admin_ads_mode_menu(target_id, source)
             await event.edit(text, parse_mode='html', buttons=buttons)
@@ -6559,7 +6582,7 @@ async def callback(event):
             source = parts[1] if len(parts) > 1 else "premium"
             user_doc = get_user(target_id)
             new_val = not user_doc.get('smart_rotation', False)
-            users_col.update_one({'user_id': target_id}, {'$set': {'smart_rotation': new_val}}, upsert=True)
+            uupdate({'user_id': target_id}, {'$set': {'smart_rotation': new_val}}, upsert=True)
             await event.answer(f"Smart Rotation {'enabled' if new_val else 'disabled'}", alert=True)
             text, buttons = admin_automation_menu(target_id, source)
             await event.edit(text, parse_mode='html', buttons=buttons)
@@ -6574,7 +6597,7 @@ async def callback(event):
             source = parts[1] if len(parts) > 1 else "premium"
             user_doc = get_user(target_id)
             new_val = not user_doc.get('auto_leave_groups', True)
-            users_col.update_one({'user_id': target_id}, {'$set': {'auto_leave_groups': new_val}}, upsert=True)
+            uupdate({'user_id': target_id}, {'$set': {'auto_leave_groups': new_val}}, upsert=True)
             await event.answer(f"Auto Leave {'enabled' if new_val else 'disabled'}", alert=True)
             text, buttons = admin_automation_menu(target_id, source)
             await event.edit(text, parse_mode='html', buttons=buttons)
@@ -6665,7 +6688,7 @@ async def callback(event):
             start = f"{start[:2]}:{start[2:]}"
             end = f"{end[:2]}:{end[2:]}"
             label = f"{start}-{end}"
-            users_col.update_one(
+            uupdate(
                 {'user_id': int(target_id)},
                 {'$set': {'quiet_hours': {'enabled': True, 'start': start, 'end': end, 'label': label}}},
                 upsert=True
@@ -6712,7 +6735,7 @@ async def callback(event):
             source = parts[1] if len(parts) > 1 else "premium"
             user_doc = get_user(target_id)
             new_val = not user_doc.get('autoreply_enabled', False)
-            users_col.update_one({'user_id': int(target_id)}, {'$set': {'autoreply_enabled': new_val}}, upsert=True)
+            uupdate({'user_id': int(target_id)}, {'$set': {'autoreply_enabled': new_val}}, upsert=True)
             await event.answer("Auto reply updated", alert=True)
             text, buttons = admin_autoreply_menu(target_id, source)
             await event.edit(text, parse_mode='html', buttons=buttons)
@@ -6776,7 +6799,7 @@ async def callback(event):
             parts = payload.split("_", 1)
             target_id = int(parts[0])
             source = parts[1] if len(parts) > 1 else "premium"
-            users_col.update_one({'user_id': int(target_id)}, {'$set': {'logs_chat_id': int(target_id)}}, upsert=True)
+            uupdate({'user_id': int(target_id)}, {'$set': {'logs_chat_id': int(target_id)}}, upsert=True)
             invalidate_logs_cache()
             await event.answer("Logs enabled", alert=True)
             text, buttons = admin_logs_menu(target_id, source)
@@ -6790,7 +6813,7 @@ async def callback(event):
             parts = payload.split("_", 1)
             target_id = int(parts[0])
             source = parts[1] if len(parts) > 1 else "premium"
-            users_col.update_one({'user_id': int(target_id)}, {'$unset': {'logs_chat_id': ""}})
+            uupdate({'user_id': int(target_id)}, {'$unset': {'logs_chat_id': ""}})
             invalidate_logs_cache()
             await event.answer("Logs disabled", alert=True)
             text, buttons = admin_logs_menu(target_id, source)
@@ -8365,7 +8388,7 @@ async def text_handler(event):
                 return
 
             label = f"{start}-{end}"
-            users_col.update_one(
+            uupdate(
                 {'user_id': int(uid)},
                 {'$set': {'quiet_hours': {'enabled': True, 'start': start, 'end': end, 'label': label}}},
                 upsert=True
@@ -8407,7 +8430,7 @@ async def text_handler(event):
                 'msg_delay': user_states[uid]['msg_delay'],
                 'round_delay': val
             }
-            users_col.update_one(
+            uupdate(
                 {'user_id': target_id},
                 {'$set': {'custom_interval': custom_interval, 'interval_preset': 'custom'}},
                 upsert=True
@@ -8453,7 +8476,7 @@ async def text_handler(event):
                 await event.respond("Start time missing. Please open Quiet Hours again.")
                 return
             label = f"{start}-{end}"
-            users_col.update_one(
+            uupdate(
                 {'user_id': int(target_id)},
                 {'$set': {'quiet_hours': {'enabled': True, 'start': start, 'end': end, 'label': label}}},
                 upsert=True
@@ -8510,7 +8533,7 @@ async def text_handler(event):
                 'msg_delay': user_states[uid]['msg_delay'],
                 'round_delay': val
             }
-            users_col.update_one({'user_id': uid}, {'$set': {'custom_interval': custom_interval, 'interval_preset': 'custom'}})
+            uupdate({'user_id': uid}, {'$set': {'custom_interval': custom_interval, 'interval_preset': 'custom'}})
             del user_states[uid]
             saved_text = (
                 "<b>Custom Interval Saved!</b>\n\n"
@@ -8877,7 +8900,7 @@ async def text_handler(event):
             await event.respond("❌ Please send a text message.")
             return
 
-        users_col.update_one({'user_id': uid}, {'$set': {'ads_custom_message': msg_text, 'ads_mode': 'custom'}}, upsert=True)
+        uupdate({'user_id': uid}, {'$set': {'ads_custom_message': msg_text, 'ads_mode': 'custom'}}, upsert=True)
         del user_states[uid]
         await event.respond("✅ Custom message saved! It will be used for ads from all added accounts.")
 
@@ -8915,7 +8938,7 @@ async def text_handler(event):
             )
             return
 
-        users_col.update_one({'user_id': uid}, {'$set': {'ads_post_link': link, 'ads_mode': 'post'}}, upsert=True)
+        uupdate({'user_id': uid}, {'$set': {'ads_post_link': link, 'ads_mode': 'post'}}, upsert=True)
         del user_states[uid]
         await event.respond("✅ Post link saved! Now ads will forward this post from all accounts.")
 
@@ -9109,7 +9132,7 @@ async def grant_premium_to_user(target_id: int, plan_key: str, days: int, *, sou
     expires_at = datetime.now() + timedelta(days=int(days))
 
     # DB update (consistent fields)
-    users_col.update_one(
+    uupdate(
         {'user_id': int(target_id)},
         {'$set': {
             'tier': 'premium',
@@ -9295,7 +9318,7 @@ async def handle_notification_actions(event):
         
         # Ban user
         try:
-            users_col.update_one(
+            uupdate(
                 {'user_id': target_user_id},
                 {'$set': {'banned': True, 'ban_reason': reason}},
                 upsert=True
@@ -9403,6 +9426,18 @@ async def main():
         asyncio.get_running_loop().set_exception_handler(_loop_exception_handler)
     except Exception as e:
         print(f"[INIT] Could not set loop exception handler: {e}")
+
+    # Bigger thread pool for db_call/to_thread so many concurrent blocking DB ops
+    # (UI handlers + worker reads) run in PARALLEL instead of serializing on the
+    # event loop. This is the main fix for UI lag as users grow.
+    try:
+        _pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=int(os.getenv('DB_THREAD_POOL', '64')),
+            thread_name_prefix='db',
+        )
+        asyncio.get_running_loop().set_default_executor(_pool)
+    except Exception as e:
+        print(f"[INIT] Could not set thread pool: {e}")
 
     serve_ui = BOT_ROLE in ('all', 'bot')          # runs the Telegram UI bot
     do_forwarding = BOT_ROLE in ('all', 'worker')  # forwards its account shard

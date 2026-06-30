@@ -355,3 +355,27 @@ human action (proxies). All thresholds are env-tunable.
 - **Async UI handlers (#2):** the UI bot runs as its own process, so its
   synchronous Mongo only affects UI responsiveness, never forwarding. A full
   async migration of the ~7k-line handler is high-risk for low gain here.
+
+
+
+## UI speed at scale (fixed)
+
+The UI bot lagged as users grew because every handler made several *synchronous*
+pymongo calls on the single event loop, serializing all concurrent users.
+
+- **`get_user` is now cached** (TTL `USER_CACHE_TTL`). Renders call it several
+  times per tap; this collapses to one DB read per window. **All user writes go
+  through `uupdate()`** which invalidates the cache, so reads are never stale
+  after a write (toggles/settings reflect immediately). Verified: 5 reads → 1 DB
+  hit; a write → next read is fresh.
+- **Bigger loop thread pool** (`DB_THREAD_POOL`, default 64): offloaded blocking
+  DB (`db_call`) runs in parallel across threads instead of blocking the loop, so
+  concurrent users don't queue behind each other.
+- **Run the UI as its own process** (`BOT_ROLE=bot`, which the manager does) so
+  forwarding never competes with the UI loop. If you run `bot.py` directly as
+  `all`, the UI shares the loop with forwarding — use `manager.py` in production.
+
+Remaining per-render reads (`get_user_accounts`, some `count_documents`) are now
+the long pole; they can be cached/offloaded next if a very large UI still lags,
+but with `get_user` cached + the thread pool, UI stays responsive into the
+thousands-of-users range.
