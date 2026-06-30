@@ -175,6 +175,7 @@ settings_col = db['bot_settings']
 worker_health_col = db['worker_health']
 click_links_col = db['click_links']
 discovered_groups_col = db['discovered_groups']
+toxic_groups_col = db['toxic_groups']
 
 # ---- Global, admin-controlled settings (e.g. the per-group send frequency) ----
 # Frequency is a GLOBAL policy: default 3 sends/hour per group, hard-capped at 3.
@@ -246,6 +247,9 @@ def ensure_indexes():
         discovered_groups_col.create_index('username')
         discovered_groups_col.create_index('niche')
         discovered_groups_col.create_index([('niche', 1), ('username', 1)])
+        # Toxic-group auto-pruning: strikes per (account, group); pruned lookup.
+        toxic_groups_col.create_index([('account_id', 1), ('group_key', 1)], unique=True)
+        toxic_groups_col.create_index([('account_id', 1), ('pruned', 1)])
     except Exception as e:
         print(f"[DB] Index creation failed: {e}")
 
@@ -712,6 +716,7 @@ def get_user(user_id):
             'forwarding_mode': 'auto',
             'ads_mode': 'saved',
             'smart_rotation': False,
+            'toxic_prune': True,
             'quiet_hours': quiet_default,
             'created_at': datetime.now(),
             '_is_new_user': True
@@ -1082,6 +1087,58 @@ def mark_group_failed(account_id, group_key, error):
 def clear_failed_groups(account_id):
     account_failed_groups_col.delete_many({'account_id': account_id})
 
+# ---- Toxic-group detection & auto-pruning -------------------------------
+# Strike thresholds per classified reason (config constants are defined lower in
+# the file, so resolve them lazily at call time).
+def _toxic_threshold(reason):
+    return {
+        'admin_only': TOXIC_ADMIN_ONLY_STRIKES,
+        'banned': TOXIC_BAN_STRIKES,
+        'slowmode': TOXIC_SLOWMODE_STRIKES,
+    }.get(reason, 3)
+_TOXIC_REASON_LABELS = {
+    'admin_only': 'admin-only (posting blocked)',
+    'banned': 'account is banned there',
+    'slowmode': 'heavy slow-mode',
+}
+
+def _toxic_prune_enabled(user_id: int) -> bool:
+    """Per-user toggle for dropping toxic groups (default ON)."""
+    try:
+        return bool(get_user_cached(int(user_id)).get('toxic_prune', TOXIC_PRUNE_DEFAULT))
+    except Exception:
+        return TOXIC_PRUNE_DEFAULT
+
+def record_toxic_strike(account_id, group_key, group_title, reason):
+    """Add a toxic strike for (account, group). Returns True if the group JUST
+    crossed its prune threshold (caller should stop sending to it). Sync -> db_call."""
+    acc_id_str = str(account_id)
+    threshold = _toxic_threshold(reason)
+    toxic_groups_col.update_one(
+        {'account_id': acc_id_str, 'group_key': group_key},
+        {'$inc': {'strikes': 1},
+         '$set': {'reason': reason, 'group_title': (group_title or '')[:80],
+                  'last_seen': datetime.now()},
+         '$setOnInsert': {'first_seen': datetime.now()}},
+        upsert=True)
+    doc = toxic_groups_col.find_one(
+        {'account_id': acc_id_str, 'group_key': group_key}, {'strikes': 1, 'pruned': 1})
+    strikes = (doc or {}).get('strikes', 1)
+    if strikes >= threshold and not (doc or {}).get('pruned'):
+        toxic_groups_col.update_one(
+            {'account_id': acc_id_str, 'group_key': group_key},
+            {'$set': {'pruned': True, 'pruned_at': datetime.now()}})
+        return True
+    return False
+
+def load_pruned_group_keys(account_id):
+    """Set of group_keys this account should skip (toxic, already pruned). Sync."""
+    return {d.get('group_key') for d in toxic_groups_col.find(
+        {'account_id': str(account_id), 'pruned': True}, {'group_key': 1})}
+
+def clear_toxic_groups(account_id):
+    toxic_groups_col.delete_many({'account_id': str(account_id)})
+
 def get_flood_wait(account_id, group_key):
     doc = account_flood_waits_col.find_one({'account_id': account_id, 'group_key': group_key})
     if doc:
@@ -1273,6 +1330,26 @@ ROTATION_CHUNK = int(os.getenv('ROTATION_CHUNK', '25'))
 # Per-account health: auto-pause an account after this many consecutive rounds
 # with a PeerFlood (Telegram is actively flagging it -> stop before it's banned).
 HEALTH_PEERFLOOD_LIMIT = int(os.getenv('HEALTH_PEERFLOOD_LIMIT', '3'))
+# ---- Toxic-group auto-pruning (default ON per user) ----
+# Some groups silently burn accounts: admin-only (can't post), they ban-on-post,
+# or they have heavy slow-mode (so the account wastes its cadence retrying). We
+# count strikes per (account, group) and, once a group crosses the threshold for
+# its reason, STOP sending to it for that account. Users can toggle this off.
+TOXIC_PRUNE_DEFAULT = os.getenv('TOXIC_PRUNE_DEFAULT', '1').strip().lower() in ('1', 'true', 'yes', 'on')
+TOXIC_ADMIN_ONLY_STRIKES = int(os.getenv('TOXIC_ADMIN_ONLY_STRIKES', '2'))  # can't-write (admin-only)
+TOXIC_BAN_STRIKES = int(os.getenv('TOXIC_BAN_STRIKES', '1'))                # banned-on-post -> drop now
+TOXIC_SLOWMODE_SEC = int(os.getenv('TOXIC_SLOWMODE_SEC', '3600'))           # slow-mode >= this = "heavy"
+TOXIC_SLOWMODE_STRIKES = int(os.getenv('TOXIC_SLOWMODE_STRIKES', '3'))      # heavy-slowmode hits to drop
+# ---- Account longevity: optional per-account daily send ceiling ----
+# 0 = unlimited (default; keeps the 3/hr-per-group policy intact). Set > 0 to cap
+# total sends per account per day as a hard safety ceiling for fragile accounts.
+MAX_DAILY_SENDS = int(os.getenv('MAX_DAILY_SENDS', '0'))
+# ---- Day/night rhythm: gently slow rounds during server-night hours ----
+# 1.0 = off. e.g. 2.0 doubles the round delay during the night window so accounts
+# look more human (quieter at night). Independent of per-user Quiet Hours.
+NIGHT_SLOWDOWN = float(os.getenv('NIGHT_SLOWDOWN', '1.0'))
+NIGHT_START_HOUR = int(os.getenv('NIGHT_START_HOUR', '1'))   # server local hour [0-23]
+NIGHT_END_HOUR = int(os.getenv('NIGHT_END_HOUR', '7'))
 # Live per-send logging: OFF by default (round summaries already report results).
 # Turn ON (LIVE_SEND_LOGS=1) only at small scale; per-send logger calls do not
 # scale (a bot FloodWaits past ~30 msgs/sec).
@@ -1333,6 +1410,7 @@ async def delete_account_and_related(account_id):
     account_auto_groups_col.delete_many({'account_id': {'$in': variant_list}})
     account_failed_groups_col.delete_many({'account_id': {'$in': variant_list}})
     account_flood_waits_col.delete_many({'account_id': {'$in': variant_list}})
+    toxic_groups_col.delete_many({'account_id': {'$in': variant_list}})
     logger_tokens_col.delete_many({'account_id': {'$in': variant_list}})
 
     for key in list(variants):
@@ -1537,6 +1615,22 @@ async def notify_auto_left(account_id, phone, group_name, group_key, reason=None
         pass
 
 
+async def notify_toxic_pruned(account_id, phone, group_name, reason):
+    """Tell the user a toxic group was dropped (and why), so it stops burning the account."""
+    try:
+        label = _TOXIC_REASON_LABELS.get(reason, reason)
+        msg = (
+            "\U0001F6E1\uFE0F <b>Toxic group dropped</b>\n"
+            f"Phone: <code>{_h(phone or 'Unknown')}</code>\n"
+            f"Group: <code>{_h(group_name or 'Unknown')}</code>\n"
+            f"Reason: <code>{_h(label)}</code>\n\n"
+            "<i>Stopped sending here to protect this account. Turn off in Settings \u2192 Automation \u2192 Drop Toxic Groups.</i>"
+        )
+        await send_log(account_id, msg)
+    except Exception:
+        pass
+
+
 async def _get_user_logs_chat_id_for_account(account_id):
     """Logs are configured once per USER and apply to all their accounts."""
     key = str(account_id)
@@ -1695,7 +1789,7 @@ async def find_niche_groups(uid, keyword, limit=50):
             uname = getattr(ch, 'username', None)
             if uname and getattr(ch, 'megagroup', False) and uname.lower() not in seen:
                 seen.add(uname.lower())
-                found.append({'username': uname, 'title': getattr(ch, 'title', uname) or uname})
+                found.append({'username': uname, 'title': getattr(ch, 'title', uname) or uname, 'members': int(getattr(ch, 'participants_count', 0) or 0)})
                 seed_entities.append(ch)
 
         # ---- Seed crawling: read recent messages of the top seed groups and
@@ -1724,7 +1818,7 @@ async def find_niche_groups(uid, keyword, limit=50):
                     un = getattr(ent, 'username', None)
                     if un and getattr(ent, 'megagroup', False) and un.lower() not in seen:
                         seen.add(un.lower())
-                        found.append({'username': un, 'title': getattr(ent, 'title', un) or un})
+                        found.append({'username': un, 'title': getattr(ent, 'title', un) or un, 'members': int(getattr(ent, 'participants_count', 0) or 0)})
                 except FloodWaitError:
                     break  # stop crawling on flood, keep what we have
                 except Exception:
@@ -1758,7 +1852,7 @@ async def find_niche_groups(uid, keyword, limit=50):
                 un = getattr(ent, 'username', None)
                 if un and getattr(ent, 'megagroup', False) and un.lower() not in seen:
                     seen.add(un.lower())
-                    found.append({'username': un, 'title': getattr(ent, 'title', un) or un})
+                    found.append({'username': un, 'title': getattr(ent, 'title', un) or un, 'members': int(getattr(ent, 'participants_count', 0) or 0)})
             except FloodWaitError:
                 break
             except Exception:
@@ -1774,6 +1868,7 @@ async def find_niche_groups(uid, keyword, limit=50):
             await client.disconnect()
         except Exception:
             pass
+    found.sort(key=lambda g: g.get('members', 0), reverse=True)
     return found, "ok"
 
 
@@ -1910,6 +2005,8 @@ async def run_forwarding_loop(user_id, account_id):
         round_num = 0
         rotation_offset = 0  # advances each round for smart rotation
         peerflood_streak = 0  # consecutive rounds with PeerFlood -> auto-pause
+        day_key = datetime.now().date()  # daily-cap reset tracker
+        day_sent = 0  # sends counted toward MAX_DAILY_SENDS today
         entity_cache = {}  # group_key -> resolved Telethon entity (reused across rounds)
         while True:
             try:
@@ -1931,6 +2028,17 @@ async def run_forwarding_loop(user_id, account_id):
                     print(f"[FORWARDING] Account {account_id} stopped")
                     break
                 
+                # Daily send ceiling (optional account-longevity safety; 0 = unlimited).
+                _today = datetime.now().date()
+                if _today != day_key:
+                    day_key = _today
+                    day_sent = 0
+                if MAX_DAILY_SENDS and day_sent >= MAX_DAILY_SENDS:
+                    print(f"[FORWARDING] {account_id} hit daily cap {MAX_DAILY_SENDS}; resting")
+                    napped = await _interruptible_round_sleep(1800, account_id, check_interval=30)
+                    if not napped:
+                        break
+                    continue
                 user = get_user_cached(user_id)
                 tier_settings = get_user_tier_settings(user_id)
                 fwd_mode = user.get('forwarding_mode', 'topics')
@@ -2057,16 +2165,22 @@ async def run_forwarding_loop(user_id, account_id):
                 _now = datetime.now()
                 failed_set = set()
                 flood_map = {}
+                pruned_set = set()
+                prune_on = _toxic_prune_enabled(user_id)
                 try:
                     def _load_round_state():
                         fset = {d.get('group_key') for d in account_failed_groups_col.find(
                             {'account_id': acc_id_str}, {'group_key': 1})}
                         fmap = {d.get('group_key'): d.get('wait_until') for d in account_flood_waits_col.find(
                             {'account_id': account_id, 'wait_until': {'$gt': _now}}, {'group_key': 1, 'wait_until': 1})}
-                        return fset, fmap
-                    failed_set, flood_map = await db_call(_load_round_state)
+                        pset = load_pruned_group_keys(account_id) if prune_on else set()
+                        return fset, fmap, pset
+                    failed_set, flood_map, pruned_set = await db_call(_load_round_state)
                 except Exception as _e:
                     print(f"[FORWARDING] Preload round state failed: {_e}")
+                # Groups we won't send to this round: permanently-failed + (toxic-pruned
+                # when the user has Drop Toxic Groups ON).
+                skip_set = failed_set | pruned_set
                 
                 if fwd_mode in ('topics', 'both'):
                     topic_groups = await db_call(lambda: list(account_topics_col.find({'account_id': acc_id_str})))
@@ -2080,7 +2194,7 @@ async def run_forwarding_loop(user_id, account_id):
                                 link = link.split('?')[0]
                             peer, url, topic_id = parse_link(link)
                             group_key = link
-                            if group_key not in failed_set:
+                            if group_key not in skip_set:
                                 groups_to_forward.append({
                                     'peer': peer,
                                     'url': url,
@@ -2100,7 +2214,7 @@ async def run_forwarding_loop(user_id, account_id):
                     
                     for ag in auto_groups:
                         group_key = str(ag['group_id'])
-                        if group_key not in failed_set:
+                        if group_key not in skip_set:
                             groups_to_forward.append({
                                 'group_id': ag['group_id'],
                                 'access_hash': ag.get('access_hash'),
@@ -2361,6 +2475,12 @@ async def run_forwarding_loop(user_id, account_id):
                         entity_cache.pop(group_key, None)
                         await db_call(mark_group_failed, account_id, group_key, str(e))
                         print(f"[FORWARDING] Permanent fail {group['title']}: {type(e).__name__}")
+                        if prune_on:
+                            _treason = ('admin_only' if isinstance(e, ChatWriteForbiddenError)
+                                        else 'banned' if isinstance(e, UserBannedInChannelError)
+                                        else None)
+                            if _treason and await db_call(record_toxic_strike, account_id, group_key, group['title'], _treason):
+                                await notify_toxic_pruned(account_id, acc.get('phone'), group['title'], _treason)
 
                         # Auto-leave the group if sending fails (only if enabled)
                         if _is_auto_leave_enabled(user_id):
@@ -2382,6 +2502,9 @@ async def run_forwarding_loop(user_id, account_id):
                         await db_call(set_flood_wait, account_id, group_key, group['title'], wait_time)
                         print(f"[FORWARDING] SlowMode {wait_time}s for {group['title']}")
                         await add_user_log(user_id, f"SlowMode {wait_time}s in {group['title'][:20]}")
+                        if prune_on and wait_time >= TOXIC_SLOWMODE_SEC:
+                            if await db_call(record_toxic_strike, account_id, group_key, group['title'], 'slowmode'):
+                                await notify_toxic_pruned(account_id, acc.get('phone'), group['title'], 'slowmode')
 
                     except PeerFloodError:
                         # Account-wide spam limit (Telegram flagged too many messages to
@@ -2438,6 +2561,7 @@ async def run_forwarding_loop(user_id, account_id):
                 # Flush accumulated stats once per round (1 write instead of N).
                 if sent or stats_failed:
                     await db_call(update_account_stats, str(account_id), sent=sent, failed=stats_failed)
+                day_sent += sent
                 _health_bump('sends', sent)
                 _health_bump('fails', stats_failed)
                 
@@ -2478,6 +2602,13 @@ async def run_forwarding_loop(user_id, account_id):
                     effective_delay = max(round_delay, int(os.getenv('PEERFLOOD_COOLDOWN', '3600')))
                     print(f"[FORWARDING] PeerFlood cooldown: waiting {effective_delay}s")
 
+                # Day/night rhythm: stretch the gap during server-night hours so an
+                # account looks more human (quieter at night). NIGHT_SLOWDOWN=1.0 -> off.
+                if NIGHT_SLOWDOWN > 1.0:
+                    _hour = datetime.now().hour
+                    _is_night = (NIGHT_START_HOUR <= _hour < NIGHT_END_HOUR) if NIGHT_START_HOUR <= NIGHT_END_HOUR else (_hour >= NIGHT_START_HOUR or _hour < NIGHT_END_HOUR)
+                    if _is_night:
+                        effective_delay = int(effective_delay * NIGHT_SLOWDOWN)
                 print(f"[FORWARDING] Waiting {effective_delay}s for next round...")
                 still_active = await _interruptible_round_sleep(effective_delay, account_id, check_interval=15)
                 if not still_active:
@@ -3139,6 +3270,12 @@ def settings_automation_keyboard(uid):
     auto_leave_enabled = user_doc.get('auto_leave_groups', True)
     leave_status = "✅ ON" if auto_leave_enabled else "❌ OFF"
     buttons.append([Button.inline(f"Auto Leave Failed: {leave_status}", b"toggle_auto_leave")])
+
+    # Drop Toxic Groups toggle (default ON): stop sending to admin-only /
+    # ban-on-post / heavy slow-mode groups that burn the account.
+    prune_enabled = user_doc.get('toxic_prune', TOXIC_PRUNE_DEFAULT)
+    prune_status = "\u2705 ON" if prune_enabled else "\u274C OFF"
+    buttons.append([Button.inline(f"\U0001F6E1\uFE0F Drop Toxic Groups: {prune_status}", b"toggle_toxic_prune")])
 
     buttons.append([Button.inline("\u2190 Back", b"menu_settings")])
     return buttons
@@ -5856,6 +5993,20 @@ async def callback(event):
             await event.edit(text, parse_mode='html', buttons=settings_automation_keyboard(uid))
             return
         
+        if data == "toggle_toxic_prune":
+            user_doc = get_user(uid)
+            current = user_doc.get('toxic_prune', TOXIC_PRUNE_DEFAULT)
+            new_value = not current
+            uupdate({'user_id': int(uid)}, {'$set': {'toxic_prune': new_value}}, upsert=True)
+            status = "enabled" if new_value else "disabled"
+            await event.answer(f"Drop Toxic Groups {status}!", alert=True)
+            text = (
+                "<b>Automation Tools</b>\n\n"
+                "Manage rotation, group join, refresh, and auto leave."
+            )
+            await event.edit(text, parse_mode='html', buttons=settings_automation_keyboard(uid))
+            return
+        
         if data == "refresh_all_groups":
             # Refresh All Groups is FREE for everyone
             accounts = get_user_accounts(uid)
@@ -8312,7 +8463,11 @@ async def text_handler(event):
             return
         usernames = [g['username'] for g in found]
         user_states[uid] = {'state': 'found_groups_ready', 'found_groups': usernames}
-        preview = "\n".join(f"• {(g['title'] or '')[:32]} (@{g['username']})" for g in found[:20])
+        def _gline(g):
+            m = g.get('members', 0)
+            mtxt = f" — {m:,} members" if m else ""
+            return f"• {(g['title'] or '')[:32]} (@{g['username']}){mtxt}"
+        preview = "\n".join(_gline(g) for g in found[:20])
         more = f"\n…and {len(found) - 20} more" if len(found) > 20 else ""
         await event.respond(
             f"<b>🔎 Found {len(found)} groups for “{_h(keyword)}”</b>\n\n{_h(preview)}{more}",
