@@ -1119,6 +1119,11 @@ def generate_token(length=16):
 # (see n8n/click-tracker.workflow.json). The bot just creates tracked links and
 # reads the counts n8n writes into click_links.
 N8N_TRACK_BASE = os.getenv('N8N_TRACK_BASE', '').strip()  # e.g. https://your-n8n/webhook/r
+# Niche group-finder crawler: after name-search, read top seeds' recent messages
+# for more group links and resolve them (finds many more groups per niche).
+FIND_CRAWL_SEEDS = int(os.getenv('FIND_CRAWL_SEEDS', '3'))     # how many seed groups to crawl
+FIND_CRAWL_MSGS = int(os.getenv('FIND_CRAWL_MSGS', '60'))      # recent messages to scan per seed
+FIND_CRAWL_RESOLVE = int(os.getenv('FIND_CRAWL_RESOLVE', '40'))  # max candidate links to resolve (flood-safety)
 
 def create_tracked_link(user_id, target_url):
     code = generate_token(8)
@@ -1679,11 +1684,47 @@ async def find_niche_groups(uid, keyword, limit=50):
         from telethon.tl.functions.contacts import SearchRequest
         res = await client(SearchRequest(q=keyword, limit=limit))
         seen = set()
+        seed_entities = []
         for ch in getattr(res, 'chats', []) or []:
             uname = getattr(ch, 'username', None)
             if uname and getattr(ch, 'megagroup', False) and uname.lower() not in seen:
                 seen.add(uname.lower())
                 found.append({'username': uname, 'title': getattr(ch, 'title', uname) or uname})
+                seed_entities.append(ch)
+
+        # ---- Seed crawling: read recent messages of the top seed groups and
+        # extract more t.me/@group links mentioned there, then resolve which are
+        # public groups. This finds far more niche groups than name-search alone.
+        if FIND_CRAWL_SEEDS > 0 and seed_entities:
+            link_re = re.compile(r'(?:t\.me/|@)([A-Za-z0-9_]{4,32})')
+            candidates = []
+            cand_seen = set()
+            for seed in seed_entities[:FIND_CRAWL_SEEDS]:
+                try:
+                    async for msg in client.iter_messages(seed, limit=FIND_CRAWL_MSGS):
+                        for u in link_re.findall(msg.message or ''):
+                            ul = u.lower()
+                            if ul not in seen and ul not in cand_seen and not ul.endswith('bot'):
+                                cand_seen.add(ul)
+                                candidates.append(u)
+                except Exception:
+                    continue
+            resolved = 0
+            for cand in candidates:
+                if resolved >= FIND_CRAWL_RESOLVE:
+                    break
+                try:
+                    ent = await client.get_entity(cand)
+                    un = getattr(ent, 'username', None)
+                    if un and getattr(ent, 'megagroup', False) and un.lower() not in seen:
+                        seen.add(un.lower())
+                        found.append({'username': un, 'title': getattr(ent, 'title', un) or un})
+                except FloodWaitError:
+                    break  # stop crawling on flood, keep what we have
+                except Exception:
+                    pass
+                resolved += 1
+                await asyncio.sleep(0.5)
     except FloodWaitError as e:
         return None, f"flood_{getattr(e, 'seconds', 0)}"
     except Exception as e:
@@ -6222,9 +6263,9 @@ async def callback(event):
                      f"<b>Tracked clicks:</b> <code>{clicks}</code>",
                      f"<b>Tracked links:</b> <code>{len(links)}</code>"]
             if links:
-                lines.append("\n<b>Top links:</b>")
-                for d in sorted(links, key=lambda x: x.get('clicks', 0), reverse=True)[:5]:
-                    lines.append(f"\u2022 <code>{d.get('clicks',0)}</code> \u2014 {_h((d.get('target_url') or '')[:40])}")
+                lines.append("\n<b>Per-link clicks:</b>")
+                for d in sorted(links, key=lambda x: x.get('clicks', 0), reverse=True)[:10]:
+                    lines.append(f"\u2022 <code>{d.get('clicks',0)}</code> \u2014 {_h((d.get('target_url') or '')[:42])}")
             if not N8N_TRACK_BASE:
                 lines.append("\n<i>Click tracking not configured (set N8N_TRACK_BASE + run the n8n workflow).</i>")
             await event.edit("\n".join(lines), parse_mode='html', buttons=[
