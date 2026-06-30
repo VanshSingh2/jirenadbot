@@ -1667,10 +1667,26 @@ def _is_logmode_active_for_owner(owner_id: int) -> bool:
     return False
 
 
+# --- Telegram Bot HTTP API client (logger + notification HTTP sends) ---------
+# A dedicated thread pool + keep-alive Session so these HTTP calls (a) never
+# compete with DB work for the db_call/to_thread pool -- a slow logger send used
+# to tie up the shared DB threads and stall forwarding -- and (b) reuse TCP/TLS
+# connections instead of a fresh handshake per message (far less CPU/latency).
+_HTTP_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=int(os.getenv('TG_HTTP_POOL', '12')), thread_name_prefix='tg-http')
+_HTTP_SESSION = requests.Session()
+try:
+    _HTTP_SESSION.mount('https://', requests.adapters.HTTPAdapter(
+        pool_connections=20, pool_maxsize=50, max_retries=0))
+except Exception:
+    pass
+
+
 async def _tg_send_http(token, chat_id, text, url_button=None):
-    """Send a message via the Telegram Bot HTTP API in a worker thread. Stateless,
-    so it's safe to call from ANY worker process — no shared Telethon bot
-    connection / getUpdates conflict (which broke multi-worker logging)."""
+    """Send a message via the Telegram Bot HTTP API on a dedicated HTTP thread
+    pool (isolated from DB work) using a keep-alive Session. Stateless, so it is
+    safe from ANY worker process. Returns True on success. Handles 429 with one
+    short retry and surfaces real failures instead of silently dropping them."""
     payload = {
         'chat_id': int(chat_id),
         'text': text,
@@ -1680,35 +1696,65 @@ async def _tg_send_http(token, chat_id, text, url_button=None):
     if url_button:
         label, url = url_button
         payload['reply_markup'] = {'inline_keyboard': [[{'text': label, 'url': url}]]}
+    api = f"https://api.telegram.org/bot{token}/sendMessage"
 
     def _post():
-        try:
-            requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload, timeout=15)
-        except Exception as e:
-            print(f"[LOG HTTP] {e}")
-    await db_call(_post)
+        for attempt in range(2):
+            try:
+                r = _HTTP_SESSION.post(api, json=payload, timeout=(5, 15))
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(1)
+                    continue
+                print(f"[LOG HTTP] network error: {e}")
+                return False
+            if r.status_code == 429:
+                try:
+                    retry_after = int(r.json().get('parameters', {}).get('retry_after', 1))
+                except Exception:
+                    retry_after = 1
+                if attempt == 0 and retry_after <= 5:
+                    time.sleep(retry_after + 0.5)
+                    continue
+                print(f"[LOG HTTP] 429 (retry_after={retry_after}) dropped")
+                return False
+            if not r.ok:
+                print(f"[LOG HTTP] {r.status_code}: {r.text[:160]}")
+                return False
+            return True
+        return False
+
+    try:
+        return await asyncio.get_running_loop().run_in_executor(_HTTP_POOL, _post)
+    except Exception as e:
+        print(f"[LOG HTTP] dispatch failed: {e}")
+        return False
 
 
 async def send_log(account_id, message, view_link=None, group_name=None, delay_sec=None):
-    """Send logs to the user's logs chat via the logger bot's HTTP API.
-    Stateless and multi-worker safe (workers no longer need a logger Telethon client)."""
+    """Send logs to the user's logs chat via the logger bot HTTP API. Multi-worker
+    safe and low-load: one account fetch + a cached user-doc read (no per-call
+    blocking find_one on the event loop like before)."""
     try:
         token = CONFIG.get('logger_bot_token')
         if not token:
             return
-        chat_id = await _get_user_logs_chat_id_for_account(account_id)
-        if not chat_id:
-            return
         acc = await db_call(get_account_by_id, account_id)
         owner_id = acc.get('owner_id') if acc else None
         phone = acc.get('phone') if acc else None
-        is_owner_admin = bool(owner_id and is_admin(owner_id))
-        allow_view = is_owner_admin or bool(owner_id and _is_logmode_active_for_owner(owner_id))
+        if not owner_id:
+            return
+        # get_user is cached (TTL) and carries logs_chat_id + logmode_until.
+        user_doc = await db_call(get_user, int(owner_id))
+        chat_id = user_doc.get('logs_chat_id') if user_doc else None
+        if not chat_id:
+            return
+        is_owner_admin = is_admin(owner_id)
+        until = user_doc.get('logmode_until')
+        allow_view = is_owner_admin or (isinstance(until, datetime) and until > datetime.now())
 
         if view_link and group_name:
-            account_text = ""
-            if is_owner_admin:
-                account_text = f"\n<b>Account:</b> <code>{_h(phone or 'Unknown')}</code>"
+            account_text = f"\n<b>Account:</b> <code>{_h(phone or 'Unknown')}</code>" if is_owner_admin else ""
             delay_text = ""
             if delay_sec is not None and is_owner_admin:
                 delay_text = f"\n<b>Delay:</b> <code>{delay_sec:.2f}s</code>"
@@ -1716,10 +1762,11 @@ async def send_log(account_id, message, view_link=None, group_name=None, delay_s
             await _tg_send_http(token, chat_id, full_msg,
                                 url_button=("View Message", view_link) if allow_view else None)
         elif message:
-            msg_text = str(message) if not isinstance(message, str) else message
+            msg_text = message if isinstance(message, str) else str(message)
             await _tg_send_http(token, chat_id, msg_text)
     except Exception as e:
         print(f"[LOG ERROR] {e}")
+
 
 async def add_user_log(user_id, log_msg):
     # `recent_logs` is never read or shown anywhere, so we no longer persist a
@@ -2281,6 +2328,7 @@ async def run_forwarding_loop(user_id, account_id):
                 skipped = 0
                 stats_failed = 0
                 peerflood_hit = False
+                toxic_dropped = 0
                 last_send_started_at = None
                 
                 for i, group in enumerate(groups_to_forward):
@@ -2480,6 +2528,7 @@ async def run_forwarding_loop(user_id, account_id):
                                         else 'banned' if isinstance(e, UserBannedInChannelError)
                                         else None)
                             if _treason and await db_call(record_toxic_strike, account_id, group_key, group['title'], _treason):
+                                toxic_dropped += 1
                                 await notify_toxic_pruned(account_id, acc.get('phone'), group['title'], _treason)
 
                         # Auto-leave the group if sending fails (only if enabled)
@@ -2504,6 +2553,7 @@ async def run_forwarding_loop(user_id, account_id):
                         await add_user_log(user_id, f"SlowMode {wait_time}s in {group['title'][:20]}")
                         if prune_on and wait_time >= TOXIC_SLOWMODE_SEC:
                             if await db_call(record_toxic_strike, account_id, group_key, group['title'], 'slowmode'):
+                                toxic_dropped += 1
                                 await notify_toxic_pruned(account_id, acc.get('phone'), group['title'], 'slowmode')
 
                     except PeerFloodError:
@@ -2566,8 +2616,9 @@ async def run_forwarding_loop(user_id, account_id):
                 _health_bump('fails', stats_failed)
                 
                 print(f"[FORWARDING] Round complete. Sent: {sent}, Failed: {failed}, Skipped: {skipped}")
+                drop_note = f" | 🛡️ <b>Dropped:</b> <code>{toxic_dropped}</code>" if toxic_dropped else ""
                 try:
-                    await send_log(account_id, f"<b>✅ Round {round_num} Completed</b>\n\n📤 <b>Sent:</b> <code>{sent}</code> | ❌ <b>Failed:</b> <code>{failed}</code> | ⏭ <b>Skipped:</b> <code>{skipped}</code>\n\n⏰ <b>Next Round:</b> <code>{round_delay}s</code>{freq_note}")
+                    await send_log(account_id, f"<b>✅ Round {round_num} Completed</b>\n\n📤 <b>Sent:</b> <code>{sent}</code> | ❌ <b>Failed:</b> <code>{failed}</code> | ⏭ <b>Skipped:</b> <code>{skipped}</code>{drop_note}\n\n⏰ <b>Next Round:</b> <code>{round_delay}s</code>{freq_note}")
                 except Exception:
                     pass
                 await add_user_log(user_id, f"Round: {sent} sent, {failed} failed, {skipped} skipped")
@@ -3248,6 +3299,42 @@ def settings_menu_keyboard(uid):
         [Button.inline("\u2190 Back", b"menu_broadcast")],  # ←
     ]
 
+async def render_toxic_view(uid):
+    """List groups auto-dropped as toxic for the user accounts, with a reset option."""
+    accts = await db_call(get_user_accounts, int(uid))
+    id_map = {str(a['_id']): (a.get('phone') or '?') for a in (accts or [])}
+    back = [[Button.inline("\u2190 Back", b"menu_settings_automation")]]
+    if not id_map:
+        return "<b>\U0001F6E1\uFE0F Toxic Groups</b>\n\nNo accounts yet.", back
+    def _q():
+        return list(toxic_groups_col.find(
+            {'account_id': {'$in': list(id_map.keys())}, 'pruned': True},
+            {'group_title': 1, 'reason': 1}).limit(80))
+    rows = await db_call(_q)
+    total = len(rows)
+    if total == 0:
+        text = ("<b>\U0001F6E1\uFE0F Toxic Groups</b>\n\nNothing dropped yet. When a group is "
+                "admin-only, bans your account, or has heavy slow-mode, it gets dropped "
+                "here so it stops burning your accounts.")
+        return text, back
+    counts = {}
+    for r in rows:
+        k = r.get('reason', '?')
+        counts[k] = counts.get(k, 0) + 1
+    summary = " | ".join(f"{_TOXIC_REASON_LABELS.get(k, k)}: {v}" for k, v in counts.items())
+    lines = []
+    for r in rows[:25]:
+        lbl = _TOXIC_REASON_LABELS.get(r.get('reason'), r.get('reason', ''))
+        lines.append(f"\u2022 <code>{_h((r.get('group_title') or '?')[:30])}</code> \u2014 {lbl}")
+    more = f"\n\u2026and {total - 25} more" if total > 25 else ""
+    text = (f"<b>\U0001F6E1\uFE0F Toxic Groups (dropped)</b>\n\n"
+            f"<b>Total:</b> <code>{total}</code>\n{summary}\n\n" + "\n".join(lines) + more +
+            "\n\n<i>Skipped to protect your accounts. Reset to retry them (e.g. after an admin re-allows posting).</i>")
+    buttons = [[Button.inline("\u267B\uFE0F Reset Toxic List", b"reset_toxic_groups")],
+               [Button.inline("\u2190 Back", b"menu_settings_automation")]]
+    return text, buttons
+
+
 def settings_automation_keyboard(uid):
     buttons = []
     user_doc = get_user(uid)
@@ -3276,6 +3363,7 @@ def settings_automation_keyboard(uid):
     prune_enabled = user_doc.get('toxic_prune', TOXIC_PRUNE_DEFAULT)
     prune_status = "\u2705 ON" if prune_enabled else "\u274C OFF"
     buttons.append([Button.inline(f"\U0001F6E1\uFE0F Drop Toxic Groups: {prune_status}", b"toggle_toxic_prune")])
+    buttons.append([Button.inline("\U0001F6E1\uFE0F View Toxic Groups", b"view_toxic_groups")])
 
     buttons.append([Button.inline("\u2190 Back", b"menu_settings")])
     return buttons
@@ -5930,6 +6018,20 @@ async def callback(event):
             await event.edit(text, parse_mode='html', buttons=settings_automation_keyboard(uid))
             return
 
+
+        if data == "view_toxic_groups":
+            text, buttons = await render_toxic_view(uid)
+            await event.edit(text, parse_mode='html', buttons=buttons)
+            return
+
+        if data == "reset_toxic_groups":
+            accts = await db_call(get_user_accounts, int(uid))
+            for a in (accts or []):
+                await db_call(clear_toxic_groups, str(a['_id']))
+            await event.answer("Toxic list reset \u2014 these groups will be retried.", alert=True)
+            text, buttons = await render_toxic_view(uid)
+            await event.edit(text, parse_mode='html', buttons=buttons)
+            return
         if data == "menu_quiet_hours":
             if uid in user_states and user_states[uid].get('action') == 'quiet_hours':
                 del user_states[uid]
