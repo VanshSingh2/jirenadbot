@@ -20,7 +20,9 @@ from telethon.errors import (
     ChatWriteForbiddenError,
     UserBannedInChannelError,
     MessageNotModifiedError,
-    UserNotParticipantError
+    UserNotParticipantError,
+    PeerFloodError,
+    SlowModeWaitError,
 )
 from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.functions.channels import GetParticipantRequest, LeaveChannelRequest
@@ -124,6 +126,19 @@ mongo_client = MongoClient(
     CONFIG['mongo_uri'],
     tlsCAFile=certifi.where(),
     tlsAllowInvalidCertificates=allow_invalid_tls,
+    # ---- Connection pool / timeout tuning (scales to many concurrent accounts) ----
+    # The bot uses a synchronous driver shared by many forwarding tasks. A bounded,
+    # reused pool prevents connection storms and the timeouts stop a slow Atlas
+    # response from hanging the whole event loop indefinitely.
+    maxPoolSize=int(os.getenv('MONGO_MAX_POOL', '100')),
+    minPoolSize=int(os.getenv('MONGO_MIN_POOL', '5')),
+    maxIdleTimeMS=60000,
+    serverSelectionTimeoutMS=int(os.getenv('MONGO_SERVER_SELECTION_MS', '8000')),
+    connectTimeoutMS=int(os.getenv('MONGO_CONNECT_MS', '8000')),
+    socketTimeoutMS=int(os.getenv('MONGO_SOCKET_MS', '20000')),
+    retryWrites=True,
+    retryReads=True,
+    appname='jirenadbot',
 )
 db = mongo_client[CONFIG['db_name']]
 
@@ -509,17 +524,78 @@ async def enforce_forcejoin_or_prompt(event, edit=False) -> bool:
     await send_forcejoin_prompt(event, edit=edit)
     return False
 
+# ===================== Lightweight TTL caches (performance) =====================
+# This bot uses a *synchronous* Mongo driver on a single asyncio event loop, so
+# every DB read blocks ALL tasks (command handling + every account's forwarding
+# loop). As the number of active users grows, the cumulative blocking time is
+# what makes the bot "lag" and delays balloon.
+#
+# These short-lived caches collapse the bursts of repeated identical reads that
+# happen in hot paths (the forwarding loop reads the same user/account doc many
+# times per round; send_log + is_admin run on every single message). TTLs are
+# deliberately tiny so interactive correctness is effectively unchanged, while
+# the per-second DB pressure drops dramatically.
+import threading as _threading
+
+_cache_lock = _threading.Lock()
+_user_cache = {}        # user_id(int)      -> (expires_monotonic, user_doc)
+_admin_cache = {}       # user_id(int)      -> (expires_monotonic, bool)
+_logs_chat_cache = {}   # account_id(str)   -> (expires_monotonic, chat_id)
+
+_USER_CACHE_TTL = float(os.getenv('USER_CACHE_TTL', '5'))
+_ADMIN_CACHE_TTL = float(os.getenv('ADMIN_CACHE_TTL', '30'))
+_LOGS_CACHE_TTL = float(os.getenv('LOGS_CACHE_TTL', '20'))
+
+
+def invalidate_user_cache(user_id=None):
+    with _cache_lock:
+        if user_id is None:
+            _user_cache.clear()
+        else:
+            _user_cache.pop(int(user_id), None)
+
+
+def invalidate_admin_cache(user_id=None):
+    with _cache_lock:
+        if user_id is None:
+            _admin_cache.clear()
+        else:
+            _admin_cache.pop(int(user_id), None)
+
+
+def invalidate_logs_cache():
+    with _cache_lock:
+        _logs_chat_cache.clear()
+
+
+async def db_call(func, *args, **kwargs):
+    """Run a blocking (pymongo) callable in a worker thread so it never freezes
+    the event loop. Use this for DB work inside hot async paths; if Atlas is slow
+    the rest of the bot stays responsive instead of stalling for everyone."""
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
 def is_admin(user_id):
     # Owner is always admin
     try:
-        if int(user_id) == int(CONFIG['owner_id']):
-            return True
-        # Check if user is in admins collection
-        is_db_admin = admins_col.find_one({'user_id': int(user_id)}) is not None
-        return is_db_admin
+        uid = int(user_id)
+    except Exception:
+        return False
+    if uid == int(CONFIG['owner_id']):
+        return True
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _admin_cache.get(uid)
+        if hit and hit[0] > now:
+            return hit[1]
+    try:
+        result = admins_col.find_one({'user_id': uid}) is not None
     except Exception as e:
         print(f"[ERROR] is_admin check failed for {user_id}: {e}")
         return False
+    with _cache_lock:
+        _admin_cache[uid] = (now + _ADMIN_CACHE_TTL, result)
+    return result
 
 def get_user(user_id):
     user = users_col.find_one({'user_id': int(user_id)})
@@ -549,12 +625,28 @@ def get_user(user_id):
         user['quiet_hours'] = quiet_default
     return user
 
+def get_user_cached(user_id):
+    """Short-TTL cached read of get_user for hot paths (forwarding loop + derived
+    permission helpers). Returns a shallow copy so callers can't pollute the
+    cache. Deliberately NOT used for ban-checks / new-user flows, which stay on
+    the uncached get_user()."""
+    uid = int(user_id)
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _user_cache.get(uid)
+        if hit and hit[0] > now:
+            return dict(hit[1])
+    user = get_user(uid)
+    with _cache_lock:
+        _user_cache[uid] = (now + _USER_CACHE_TTL, user)
+    return dict(user)
+
 def is_premium(user_id):
     """Premium check with expiry enforcement (auto-downgrade when expired)."""
     if is_admin(user_id):
         return True
 
-    user = get_user(user_id)
+    user = get_user_cached(user_id)
     if user.get('tier') != 'premium':
         return False
 
@@ -586,7 +678,7 @@ def get_user_auto_group_limit(user_id):
     """Plan-specific cap for auto groups per account."""
     if is_admin(user_id):
         return None
-    user = get_user(user_id)
+    user = get_user_cached(user_id)
     if not is_premium(user_id):
         return FREE_TIER.get('max_auto_groups', 0)
     plan_key = normalize_plan_key(user.get('plan') or user.get('plan_name'))
@@ -597,7 +689,7 @@ def get_user_auto_group_limit(user_id):
 def get_user_max_accounts(user_id):
     if is_admin(user_id):
         return 999  # Admins get unlimited accounts
-    user = get_user(user_id)
+    user = get_user_cached(user_id)
     return get_plan_max_accounts(user)
 
 def normalize_plan_key(value: str) -> str:
@@ -663,7 +755,7 @@ def get_plan_max_accounts(user: dict) -> int:
 def is_approved(user_id):
     if is_admin(user_id):
         return True
-    user = get_user(user_id)
+    user = get_user_cached(user_id)
     return user.get('approved', False)
 
 def approve_user(user_id):
@@ -672,6 +764,7 @@ def approve_user(user_id):
         {'$set': {'approved': True, 'approved_at': datetime.now()}},
         upsert=True
     )
+    invalidate_user_cache(user_id)
 
 def set_user_premium(user_id, max_accounts, plan_name='premium'):
     """Grant premium with 30-day expiry (monthly subscription)."""
@@ -695,6 +788,7 @@ def set_user_premium(user_id, max_accounts, plan_name='premium'):
         }},
         upsert=True
     )
+    invalidate_user_cache(user_id)
 
 def remove_user_premium(user_id):
     """Downgrade user to free and clear premium-related fields."""
@@ -710,6 +804,7 @@ def remove_user_premium(user_id):
             'plan_expiry': None,
         }}
     )
+    invalidate_user_cache(user_id)
 
 def get_all_users():
     return list(users_col.find({}))
@@ -1008,7 +1103,7 @@ async def safe_leave_chat(client, target):
 def _is_auto_leave_enabled(user_id: int) -> bool:
     """User-level toggle for whether bot should auto-leave groups on permanent send failures."""
     try:
-        doc = get_user(int(user_id))
+        doc = get_user_cached(int(user_id))
         return bool(doc.get('auto_leave_groups', True))
     except Exception:
         return True
@@ -1024,7 +1119,7 @@ def _parse_time_24h(value: str):
 
 def _get_quiet_hours_wait(user_id: int, user_doc=None):
     if user_doc is None:
-        user_doc = get_user(user_id)
+        user_doc = get_user_cached(user_id)
     q = user_doc.get('quiet_hours') or {}
     if not q.get('enabled'):
         return 0, None
@@ -1058,6 +1153,25 @@ def _get_quiet_hours_wait(user_id: int, user_doc=None):
             wait_secs = int((end_dt - now).total_seconds())
             return max(wait_secs, 0), label
         return 0, label
+
+async def _interruptible_round_sleep(total_seconds, account_id, check_interval=15):
+    """Sleep up to total_seconds while still honoring stop requests.
+
+    Stopping a broadcast cancels this task, so asyncio cancellation is the primary
+    (instant) stop mechanism. The periodic is_forwarding check is only a fallback
+    for flag-based stops. This replaces the old per-second DB poll, cutting idle
+    DB load by ~check_interval x per active account (the main cause of lag at
+    scale)."""
+    remaining = int(max(0, total_seconds))
+    while remaining > 0:
+        step = min(int(check_interval), remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+        acc = get_account_by_id(account_id)
+        if not acc or not acc.get('is_forwarding', False):
+            return False
+    return True
+
 
 async def _sleep_quiet_hours(wait_seconds: int, account_id):
     remaining = int(wait_seconds)
@@ -1144,19 +1258,26 @@ async def notify_auto_left(account_id, phone, group_name, group_key, reason=None
 
 async def _get_user_logs_chat_id_for_account(account_id):
     """Logs are configured once per USER and apply to all their accounts."""
+    key = str(account_id)
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _logs_chat_cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    result = None
     try:
         acc = accounts_col.find_one({'_id': account_id}, {'owner_id': 1})
-        if not acc:
-            return None
-        owner_id = acc.get('owner_id')
-        if not owner_id:
-            return None
-        user_doc = users_col.find_one({'user_id': int(owner_id)}, {'logs_chat_id': 1})
-        if not user_doc:
-            return None
-        return user_doc.get('logs_chat_id')
+        if acc:
+            owner_id = acc.get('owner_id')
+            if owner_id:
+                user_doc = users_col.find_one({'user_id': int(owner_id)}, {'logs_chat_id': 1})
+                if user_doc:
+                    result = user_doc.get('logs_chat_id')
     except Exception:
-        return None
+        result = None
+    with _cache_lock:
+        _logs_chat_cache[key] = (now + _LOGS_CACHE_TTL, result)
+    return result
 
 def _is_logmode_active_for_owner(owner_id: int) -> bool:
     try:
@@ -1279,6 +1400,7 @@ async def run_forwarding_loop(user_id, account_id):
                 print(f"[AUTO-REPLY] Attached to account {account_id} with message: {reply_text[:30]}...")
         
         round_num = 0
+        entity_cache = {}  # group_key -> resolved Telethon entity (reused across rounds)
         while True:
             try:
                 round_num += 1
@@ -1287,7 +1409,7 @@ async def run_forwarding_loop(user_id, account_id):
                     print(f"[FORWARDING] Account {account_id} stopped")
                     break
                 
-                user = get_user(user_id)
+                user = get_user_cached(user_id)
                 tier_settings = get_user_tier_settings(user_id)
                 fwd_mode = user.get('forwarding_mode', 'topics')
                 
@@ -1369,7 +1491,7 @@ async def run_forwarding_loop(user_id, account_id):
                 # Round start log so user can confirm next round started
                 try:
                     # Get user settings for display
-                    user_doc = get_user(user_id)
+                    user_doc = get_user_cached(user_id)
                     
                     # Fix mode display to show user-friendly text
                     if fwd_mode == 'topics':
@@ -1455,12 +1577,20 @@ async def run_forwarding_loop(user_id, account_id):
                 sent = 0
                 failed = 0
                 skipped = 0
+                stats_failed = 0
+                peerflood_hit = False
                 last_send_started_at = None
                 
                 for i, group in enumerate(groups_to_forward):
-                    acc = accounts_col.find_one({'_id': account_id})
-                    if not acc or not acc.get('is_forwarding'):
-                        break
+                    # Re-check the stop flag only periodically. Stopping cancels this
+                    # task (instant), so this DB read is just a fallback; doing it every
+                    # 10th group instead of every group avoids hundreds of blocking
+                    # queries per round when an account has many groups.
+                    if i % 10 == 0:
+                        fresh_acc = accounts_col.find_one({'_id': account_id})
+                        if not fresh_acc or not fresh_acc.get('is_forwarding'):
+                            break
+                        acc = fresh_acc
 
                     wait_seconds, quiet_label = _get_quiet_hours_wait(user_id, user)
                     if wait_seconds > 0:
@@ -1498,17 +1628,20 @@ async def run_forwarding_loop(user_id, account_id):
                         if group['type'] == 'topic':
                             peer = group['peer']
                             current_topic_id = group.get('topic_id')
-                            current_entity = None
+                            current_entity = entity_cache.get(group_key)
                             
-                            try:
-                                if isinstance(peer, str):
-                                    current_entity = await client.get_entity(peer)
-                                elif isinstance(peer, int):
-                                    if peer > 0:
-                                        peer = int('-100' + str(peer))
-                                    current_entity = await client.get_entity(peer)
-                            except:
-                                pass
+                            if current_entity is None:
+                                try:
+                                    if isinstance(peer, str):
+                                        current_entity = await client.get_entity(peer)
+                                    elif isinstance(peer, int):
+                                        if peer > 0:
+                                            peer = int('-100' + str(peer))
+                                        current_entity = await client.get_entity(peer)
+                                except:
+                                    pass
+                                if current_entity is not None:
+                                    entity_cache[group_key] = current_entity
                             
                             if current_entity is None:
                                 raise Exception(f"Cannot resolve topic peer: {peer}")
@@ -1553,10 +1686,10 @@ async def run_forwarding_loop(user_id, account_id):
                                         else:
                                             sent_msg_id = result.id
                         else:
-                            current_entity = None
+                            current_entity = entity_cache.get(group_key)
                             group_id = group['group_id']
                             
-                            if group.get('username'):
+                            if current_entity is None and group.get('username'):
                                 try:
                                     current_entity = await client.get_entity(group['username'])
                                 except:
@@ -1578,6 +1711,7 @@ async def run_forwarding_loop(user_id, account_id):
                             if current_entity is None:
                                 raise Exception(f"Cannot resolve entity for group {group_id}")
                             
+                            entity_cache[group_key] = current_entity
                             group_name = group['title'][:30]
 
                             if ads_mode == 'custom':
@@ -1621,8 +1755,8 @@ async def run_forwarding_loop(user_id, account_id):
                             if view_link:
                                 await send_log(account_id, None, view_link=view_link, group_name=group_name, delay_sec=send_gap)
                         
-                        # Update stats in correct collection
-                        update_account_stats(str(account_id), sent=1)
+                        # Stats are flushed once per round (see end of loop) to avoid
+                        # a blocking DB write on every single message.
                         
                     except FloodWaitError as e:
                         wait_time = e.seconds
@@ -1633,6 +1767,7 @@ async def run_forwarding_loop(user_id, account_id):
                         
                     except (ChannelPrivateError, ChatWriteForbiddenError, UserBannedInChannelError) as e:
                         failed += 1
+                        entity_cache.pop(group_key, None)
                         mark_group_failed(account_id, group_key, str(e))
                         print(f"[FORWARDING] Permanent fail {group['title']}: {type(e).__name__}")
 
@@ -1650,8 +1785,35 @@ async def run_forwarding_loop(user_id, account_id):
                         else:
                             await add_user_log(user_id, f"Auto-leave disabled; kept {group['title'][:20]}")
                         
+                    except SlowModeWaitError as e:
+                        failed += 1
+                        wait_time = int(getattr(e, 'seconds', 60) or 60)
+                        set_flood_wait(account_id, group_key, group['title'], wait_time)
+                        print(f"[FORWARDING] SlowMode {wait_time}s for {group['title']}")
+                        await add_user_log(user_id, f"SlowMode {wait_time}s in {group['title'][:20]}")
+
+                    except PeerFloodError:
+                        # Account-wide spam limit (Telegram flagged too many messages to
+                        # new peers). Stop this round immediately and cool down hard rather
+                        # than risk an account ban.
+                        failed += 1
+                        peerflood_hit = True
+                        print(f"[FORWARDING] PeerFlood for account {account_id} - cooling down")
+                        await add_user_log(user_id, "PeerFlood detected - pausing this account to stay safe")
+                        try:
+                            await send_log(
+                                account_id,
+                                "<b>⚠ PeerFlood detected</b>\n\n"
+                                "<i>Telegram flagged this account for sending too fast. "
+                                "Pausing it for a while to avoid a ban.</i>"
+                            )
+                        except Exception:
+                            pass
+                        break
+
                     except Exception as e:
                         failed += 1
+                        entity_cache.pop(group_key, None)
                         error_str = str(e)
                         wait_match = re.search(r'wait of (\d+) seconds', error_str, re.IGNORECASE)
                         if wait_match:
@@ -1674,10 +1836,16 @@ async def run_forwarding_loop(user_id, account_id):
                             else:
                                 await add_user_log(user_id, f"Auto-leave disabled; kept {group['title'][:20]}")
 
-                        # Update stats in correct collection
-                        update_account_stats(str(account_id), failed=1)
+                        # Counted here; stats are flushed once per round below.
+                        stats_failed += 1
                     
-                    await asyncio.sleep(msg_delay)
+                    # Small random jitter so many accounts don't hit Telegram in
+                    # lockstep (reduces synchronized bursts -> fewer flood errors).
+                    await asyncio.sleep(msg_delay + random.uniform(0, max(1.0, msg_delay * 0.25)))
+                
+                # Flush accumulated stats once per round (1 write instead of N).
+                if sent or stats_failed:
+                    update_account_stats(str(account_id), sent=sent, failed=stats_failed)
                 
                 print(f"[FORWARDING] Round complete. Sent: {sent}, Failed: {failed}, Skipped: {skipped}")
                 try:
@@ -1691,14 +1859,18 @@ async def run_forwarding_loop(user_id, account_id):
                     print(f"[{account_id}] Stopped before round delay")
                     break
                 
-                print(f"[FORWARDING] Waiting {round_delay}s for next round...")
-                for _ in range(round_delay):
-                    # Check every second if forwarding was stopped
-                    acc = get_account_by_id(account_id)
-                    if not acc or not acc.get('is_forwarding', False):
-                        print(f"[{account_id}] Stopped during round delay")
-                        break
-                    await asyncio.sleep(1)
+                # If we hit a PeerFlood this round, wait much longer than the normal
+                # round delay to let Telegram's spam flag cool off.
+                effective_delay = round_delay
+                if peerflood_hit:
+                    effective_delay = max(round_delay, int(os.getenv('PEERFLOOD_COOLDOWN', '3600')))
+                    print(f"[FORWARDING] PeerFlood cooldown: waiting {effective_delay}s")
+
+                print(f"[FORWARDING] Waiting {effective_delay}s for next round...")
+                still_active = await _interruptible_round_sleep(effective_delay, account_id, check_interval=15)
+                if not still_active:
+                    print(f"[{account_id}] Stopped during round delay")
+                    break
                 
             except asyncio.CancelledError:
                 print(f"[FORWARDING] Task cancelled for account {account_id}")
@@ -2814,6 +2986,7 @@ async def cmd_addadmin(event):
     
     # Add to admins
     admins_col.insert_one({'user_id': target_uid, 'added_at': datetime.now(), 'added_by': uid})
+    invalidate_admin_cache(target_uid)
     
     # Notify
     try:
@@ -2839,6 +3012,7 @@ async def cmd_rmadmin(event):
     
     # Remove from admins
     result = admins_col.delete_one({'user_id': target_uid})
+    invalidate_admin_cache(target_uid)
     
     if result.deleted_count > 0:
         # Notify
@@ -5148,6 +5322,7 @@ async def callback(event):
         if data == "logs_enable_global":
             # Enable logs globally for user (applies to all accounts)
             users_col.update_one({'user_id': int(uid)}, {'$set': {'logs_chat_id': int(uid)}}, upsert=True)
+            invalidate_logs_cache()
             await event.answer("Logs enabled", alert=True)
             await event.edit(
                 "<b>✅ Logs Enabled</b>\n\n<blockquote>Logs will now be sent for <b>all</b> your added accounts.</blockquote>",
@@ -5158,6 +5333,7 @@ async def callback(event):
 
         if data == "logs_disable_global":
             users_col.update_one({'user_id': int(uid)}, {'$unset': {'logs_chat_id': ""}})
+            invalidate_logs_cache()
             await event.answer("Logs disabled", alert=True)
             await event.edit(
                 "<b>❌ Logs Disabled</b>\n\n<i>You will no longer receive logs.</i>",
@@ -5985,6 +6161,7 @@ async def callback(event):
             target_id = int(parts[0])
             source = parts[1] if len(parts) > 1 else "premium"
             users_col.update_one({'user_id': int(target_id)}, {'$set': {'logs_chat_id': int(target_id)}}, upsert=True)
+            invalidate_logs_cache()
             await event.answer("Logs enabled", alert=True)
             text, buttons = admin_logs_menu(target_id, source)
             await event.edit(text, parse_mode='html', buttons=buttons)
@@ -5998,6 +6175,7 @@ async def callback(event):
             target_id = int(parts[0])
             source = parts[1] if len(parts) > 1 else "premium"
             users_col.update_one({'user_id': int(target_id)}, {'$unset': {'logs_chat_id': ""}})
+            invalidate_logs_cache()
             await event.answer("Logs disabled", alert=True)
             text, buttons = admin_logs_menu(target_id, source)
             await event.edit(text, parse_mode='html', buttons=buttons)
@@ -8155,6 +8333,7 @@ async def logger_handler(event):
         await logger_bot.send_message(chat_id, "Logger connected! You'll receive forwarding logs here.")
         
         update_account_settings(state['account_id'], {'logs_chat_id': chat_id})
+        invalidate_logs_cache()
         
         del user_states[key]
         await event.respond("Logs configured!")
@@ -8670,12 +8849,7 @@ async def forwarder_loop(account_id, selected_topic, user_id):
                     break
                 
                 print(f"[{account_id}] Waiting {round_delay}s...")
-                for _ in range(round_delay):
-                    acc = get_account_by_id(account_id)
-                    if not acc or not acc.get('is_forwarding', False):
-                        print(f"[{account_id}] Stopped during round delay")
-                        break
-                    await asyncio.sleep(1)
+                await _interruptible_round_sleep(round_delay, account_id, check_interval=15)
                 
                 await client.disconnect()
                 
