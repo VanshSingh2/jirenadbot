@@ -302,3 +302,31 @@ aggregate each cycle and adapts — distinguishing two very different problems:
 So the manager now adjusts BOTH levers automatically: worker count (by account
 load) and accounts-per-worker (by connection health), while flagging flood for
 human action (proxies). All thresholds are env-tunable.
+
+
+
+## Hardening pass (high-scale review)
+
+- **Index on `is_forwarding`** added (`accounts.is_forwarding` + compound
+  `[(is_forwarding,1),(owner_id,1)]`). The reconciler/manager query this every
+  cycle; previously it was a collection scan at scale. The compound index also
+  *covers* the reconciler's `{_id, owner_id}` projection (index-only read).
+- **Mongo pool default lowered to 50/process.** Total connections ≈
+  `(workers+2) × MONGO_MAX_POOL`; keep this within your cluster's limit
+  (Atlas M10 ≈ 1500). Lower `MONGO_MAX_POOL` further if you run many workers.
+
+### Known remaining limits to plan for (not yet done)
+1. **Logger bot across multiple workers** shares one bot token; many Telethon
+   connections on the same token can conflict. At multi-worker scale, route
+   worker logs via the HTTP Bot API (stateless) or only log from the UI process.
+2. **UI command handlers still use synchronous Mongo** — fine for forwarding
+   (separate workers) but can lag the UI bot under thousands of *simultaneous*
+   button taps. Migrate hot handler reads to the TTL cache / `db_call`.
+3. **Worker pool restarts fully on cap/count change** (brief pause). Consistent
+   hashing for shard ownership would let workers join/leave without a full
+   reshuffle.
+4. **MongoDB is the single coordination point / SPOF.** Use a real cluster
+   (M10+), and at very high read volume enable secondary reads for the
+   reconciler/health queries.
+5. **Process-level restarts** still need a supervisor (systemd `Restart=always`
+   or Docker `restart: unless-stopped`) in front of `manager.py`.

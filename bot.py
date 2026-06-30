@@ -138,7 +138,9 @@ mongo_client = MongoClient(
     # The bot uses a synchronous driver shared by many forwarding tasks. A bounded,
     # reused pool prevents connection storms and the timeouts stop a slow Atlas
     # response from hanging the whole event loop indefinitely.
-    maxPoolSize=int(os.getenv('MONGO_MAX_POOL', '100')),
+    # NOTE: this is PER PROCESS. With the manager running N workers, total Mongo
+    # connections ≈ (N+2) * maxPoolSize, so keep it modest (Atlas M10 ~1500 max).
+    maxPoolSize=int(os.getenv('MONGO_MAX_POOL', '50')),
     minPoolSize=int(os.getenv('MONGO_MIN_POOL', '5')),
     maxIdleTimeMS=60000,
     serverSelectionTimeoutMS=int(os.getenv('MONGO_SERVER_SELECTION_MS', '8000')),
@@ -209,6 +211,10 @@ def ensure_indexes():
 
         accounts_col.create_index('owner_id')
         accounts_col.create_index([('owner_id', 1), ('is_forwarding', 1)])
+        # The reconciler/manager query is_forwarding directly every cycle. Without a
+        # leading-is_forwarding index these were COLLECTION SCANS at scale. This
+        # compound index also covers the reconciler's {_id, owner_id} projection.
+        accounts_col.create_index([('is_forwarding', 1), ('owner_id', 1)])
 
         account_topics_col.create_index([('account_id', 1), ('topic', 1)])
         account_auto_groups_col.create_index([('account_id', 1), ('group_id', 1)])
