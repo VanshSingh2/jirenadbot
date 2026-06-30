@@ -400,3 +400,26 @@ Notes:
   local `mongodb://` connects without TLS (pymongo would otherwise error).
 - Sizing: 2 GB is plenty for ≤500 accounts; 4 GB for a few thousand (this bot's
   dataset is tens of MB). Use SSD; back up the volume.
+
+
+
+## Anti-ban features (Tier 1) — keeping accounts alive
+
+1. **Spintax message variation** — `spin()` resolves `{a|b|c}` (nested) in the
+   custom ad text, picking a random option per send so accounts don't broadcast
+   identical text to many groups (the classic spam fingerprint). Automatic: no
+   braces = unchanged.
+2. **Smart rotation** (per-user toggle) — sends one rotating chunk of
+   `ROTATION_CHUNK` groups per round instead of all at once; `round_delay` is
+   scaled by the bucket count so each group still hits the 3/hr target, just in
+   smaller, more human bursts.
+3. **Account warmup** — accounts younger than `WARMUP_DAYS` (hard-capped at 2)
+   ramp group volume from `WARMUP_MIN_FRACTION` up to 100% over the window, so a
+   fresh account isn't instantly flagged. Uses the account's `added_at`.
+4. **Per-account health auto-pause** — after `HEALTH_PEERFLOOD_LIMIT` consecutive
+   PeerFlood rounds, the account is auto-paused (`is_forwarding=false`,
+   `health_paused=true`) and the user is notified, instead of being pushed toward
+   a ban. Restarting the account clears the health/auth flags.
+
+All four respect the global 3/hr-per-group frequency policy. Campaign scheduling
+(future) will only gate the time windows; the 3/hr rule still governs sends.

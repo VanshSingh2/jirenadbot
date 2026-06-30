@@ -931,7 +931,7 @@ async def start_broadcast_for_user(target_id: int) -> int:
             print(f"[ADS DEBUG] Auto groups count: {auto_count}")
             has_groups = auto_count > 0
         print(f"[ADS DEBUG] has_groups={has_groups}")
-        accounts_col.update_one({'_id': acc['_id']}, {'$set': {'is_forwarding': True}})
+        accounts_col.update_one({'_id': acc['_id']}, {'$set': {'is_forwarding': True}, '$unset': {'health_paused': '', 'health_paused_at': '', 'auth_invalid': ''}})
         # Start locally now if we own this account; else the owning worker's
         # reconciler picks it up from the is_forwarding flag.
         if ensure_account_running(target_id, acc['_id']):
@@ -1224,6 +1224,19 @@ TARGET_MIN_CYCLE_FLOOR = int(os.getenv('TARGET_MIN_CYCLE_FLOOR', '30'))
 # Hard floor for per-message delay (anti-burst safety; prevents flooding 100 groups
 # in seconds even when the cadence is capped). Applies even to old stored values.
 MIN_MSG_DELAY = int(os.getenv('MIN_MSG_DELAY', '5'))
+# ---- Anti-ban: warmup + smart rotation ----
+# Warmup: new accounts ramp up group volume gradually over WARMUP_DAYS (hard cap 2)
+# so a fresh account isn't instantly flagged for mass-messaging.
+WARMUP_ENABLED = os.getenv('WARMUP_ENABLED', '1').strip().lower() in ('1', 'true', 'yes', 'on')
+WARMUP_DAYS = min(2.0, float(os.getenv('WARMUP_DAYS', '2')))   # never exceed 2 days
+WARMUP_MIN_FRACTION = float(os.getenv('WARMUP_MIN_FRACTION', '0.15'))  # start at 15% of groups
+WARMUP_MIN_GROUPS = int(os.getenv('WARMUP_MIN_GROUPS', '5'))
+# Smart rotation: send this many groups per round (one chunk); rounds rotate
+# through chunks so the account bursts less. Per-group frequency is preserved.
+ROTATION_CHUNK = int(os.getenv('ROTATION_CHUNK', '25'))
+# Per-account health: auto-pause an account after this many consecutive rounds
+# with a PeerFlood (Telegram is actively flagging it -> stop before it's banned).
+HEALTH_PEERFLOOD_LIMIT = int(os.getenv('HEALTH_PEERFLOOD_LIMIT', '3'))
 # Live per-send logging: OFF by default (round summaries already report results).
 # Turn ON (LIVE_SEND_LOGS=1) only at small scale; per-send logger calls do not
 # scale (a bot FloodWaits past ~30 msgs/sec).
@@ -1602,6 +1615,25 @@ async def _fire_live_log(account_id, view_link, group_name, send_gap):
         _pending_live_logs -= 1
 
 
+_SPINTAX_RE = re.compile(r'\{([^{}]*)\}')
+
+
+def spin(text):
+    """Resolve spintax: '{a|b|c}' -> a random option, supports nesting.
+    Returns text unchanged if there are no braces. Used to vary each outgoing ad
+    so accounts don't send identical messages to many groups (anti-spam-flag)."""
+    if not text or '{' not in text:
+        return text
+    out = text
+    prev = None
+    guard = 0
+    while '{' in out and out != prev and guard < 50:
+        prev = out
+        out = _SPINTAX_RE.sub(lambda m: random.choice(m.group(1).split('|')), out)
+        guard += 1
+    return out
+
+
 async def run_forwarding_loop(user_id, account_id):
     print(f"[FORWARDING] Starting loop for account {account_id}")
     client = None
@@ -1678,6 +1710,8 @@ async def run_forwarding_loop(user_id, account_id):
                 print(f"[AUTO-REPLY] Attached to account {account_id} with message: {reply_text[:30]}...")
         
         round_num = 0
+        rotation_offset = 0  # advances each round for smart rotation
+        peerflood_streak = 0  # consecutive rounds with PeerFlood -> auto-pause
         entity_cache = {}  # group_key -> resolved Telethon entity (reused across rounds)
         while True:
             try:
@@ -1888,21 +1922,45 @@ async def run_forwarding_loop(user_id, account_id):
                     await asyncio.sleep(60)
                     continue
                 
+                # ---- Warmup: new accounts ramp up gradually (hard cap WARMUP_DAYS) ----
+                if WARMUP_ENABLED and acc.get('added_at'):
+                    try:
+                        age_days = (datetime.now() - acc['added_at']).total_seconds() / 86400.0
+                    except Exception:
+                        age_days = 999.0
+                    if 0 <= age_days < WARMUP_DAYS and groups_to_forward:
+                        frac = max(WARMUP_MIN_FRACTION, age_days / WARMUP_DAYS)
+                        cap = max(WARMUP_MIN_GROUPS, int(len(groups_to_forward) * frac))
+                        if cap < len(groups_to_forward):
+                            groups_to_forward = groups_to_forward[:cap]
+                            print(f"[FORWARDING] {account_id}: warmup {age_days:.1f}d -> {cap} groups")
+
+                # ---- Smart rotation: send one rotating chunk per round ----
+                rotation_buckets = 1
+                if user.get('smart_rotation') and len(groups_to_forward) > ROTATION_CHUNK:
+                    total_g = len(groups_to_forward)
+                    rotation_buckets = (total_g + ROTATION_CHUNK - 1) // ROTATION_CHUNK  # integer ceil
+                    start = (rotation_offset % rotation_buckets) * ROTATION_CHUNK
+                    groups_to_forward = groups_to_forward[start:start + ROTATION_CHUNK]
+                    rotation_offset += 1
+
                 # ---- Target-frequency pacing -------------------------------
                 # Frequency is a GLOBAL admin-managed policy (default 3/hr, max 3).
-                # Auto-compute the cycle delay so each group is messaged ~that often,
-                # regardless of how many groups this account has.
+                # With K rotation buckets, K rounds = one full pass over all groups,
+                # so each round targets target_cycle/K to keep per-group freq = target.
                 n_groups = len(groups_to_forward)
                 est_round_send = n_groups * msg_delay  # seconds (approx; msg_delay dominates)
                 target_per_hour = get_effective_target_per_hour()
-                target_cycle = 3600.0 / target_per_hour
+                target_cycle = (3600.0 / target_per_hour) / rotation_buckets
                 round_delay = max(TARGET_MIN_CYCLE_FLOOR, int(target_cycle - est_round_send))
-                achievable = 3600.0 / max(1.0, est_round_send + round_delay)
+                full_pass = rotation_buckets * (est_round_send + round_delay)
+                achievable = 3600.0 / max(1.0, full_pass)
                 if est_round_send + TARGET_MIN_CYCLE_FLOOR >= target_cycle:
-                    freq_note = (f" | WARN {n_groups} groups x {msg_delay}s = {est_round_send//60}m/round; "
+                    freq_note = (f" | WARN {n_groups}g x {msg_delay}s/round (K={rotation_buckets}); "
                                  f"max ~{achievable:.1f}/hr (target {target_per_hour}/hr)")
                 else:
-                    freq_note = f" | ~{achievable:.1f}/hr per group (target {target_per_hour}/hr)"
+                    freq_note = (f" | ~{achievable:.1f}/hr per group "
+                                 f"(target {target_per_hour}/hr, K={rotation_buckets})")
                 print(f"[FORWARDING] {account_id}: {n_groups} groups, msg_delay={msg_delay}s, "
                       f"round_delay={round_delay}s{freq_note}")
 
@@ -1986,9 +2044,9 @@ async def run_forwarding_loop(user_id, account_id):
                                 if last_send_started_at is not None:
                                     send_gap = send_started - last_send_started_at
                                 if current_topic_id:
-                                    r = await client.send_message(current_entity, custom_text, reply_to=current_topic_id)
+                                    r = await client.send_message(current_entity, spin(custom_text), reply_to=current_topic_id)
                                 else:
-                                    r = await client.send_message(current_entity, custom_text)
+                                    r = await client.send_message(current_entity, spin(custom_text))
                                 sent_msg_id = getattr(r, 'id', None)
 
                             elif ads_mode == 'post':
@@ -2051,7 +2109,7 @@ async def run_forwarding_loop(user_id, account_id):
                                 send_started = time.monotonic()
                                 if last_send_started_at is not None:
                                     send_gap = send_started - last_send_started_at
-                                r = await client.send_message(current_entity, custom_text)
+                                r = await client.send_message(current_entity, spin(custom_text))
                                 sent_msg_id = getattr(r, 'id', None)
 
                             elif ads_mode == 'post':
@@ -2197,6 +2255,24 @@ async def run_forwarding_loop(user_id, account_id):
                     print(f"[{account_id}] Stopped before round delay")
                     break
                 
+                # Per-account health: repeated PeerFlood means Telegram is actively
+                # flagging this account -> auto-pause it before it gets banned.
+                peerflood_streak = peerflood_streak + 1 if peerflood_hit else 0
+                if peerflood_streak >= HEALTH_PEERFLOOD_LIMIT:
+                    print(f"[FORWARDING] {account_id} auto-paused (PeerFlood x{peerflood_streak})")
+                    await db_call(accounts_col.update_one, {'_id': account_id},
+                        {'$set': {'is_forwarding': False, 'health_paused': True,
+                                  'health_paused_at': datetime.now()}})
+                    try:
+                        await send_log(account_id,
+                            "<b>\u26d4 Account auto-paused (health protection)</b>\n\n"
+                            f"<i>Telegram flagged this account with PeerFlood {peerflood_streak} rounds in a "
+                            "row. Forwarding was paused to protect it from a ban. Let it rest, then start "
+                            "again when ready.</i>")
+                    except Exception:
+                        pass
+                    break
+
                 # If we hit a PeerFlood this round, wait much longer than the normal
                 # round delay to let Telegram's spam flag cool off.
                 effective_delay = round_delay
