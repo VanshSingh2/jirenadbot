@@ -43,7 +43,44 @@ from pymongo import MongoClient
 from config import BOT_CONFIG
 
 # ----------------------------- configuration --------------------------------
-MAX_ACCOUNTS_PER_WORKER = int(os.getenv('MAX_ACCOUNTS_PER_WORKER', '150'))
+# Per-worker account cap. Default baseline is 100; with AUTO_WORKER_CAP on
+# (default), the manager auto-detects the machine's CPU/RAM and LOWERS the cap if
+# the box can't safely hold 100/worker (it never raises above the configured value
+# unless you raise MAX_ACCOUNTS_PER_WORKER yourself).
+WORKER_CAP_MIN = int(os.getenv('WORKER_CAP_MIN', '20'))
+WORKER_CAP_MAX = int(os.getenv('WORKER_CAP_MAX', '200'))
+PER_ACCOUNT_MB = float(os.getenv('PER_ACCOUNT_MB', '15'))   # est. RAM per connected account
+RAM_RESERVE_MB = float(os.getenv('RAM_RESERVE_MB', '1024')) # RAM left for OS + UI bot + overhead
+_CONFIGURED_CAP = int(os.getenv('MAX_ACCOUNTS_PER_WORKER', '100'))
+_AUTO_WORKER_CAP = os.getenv('AUTO_WORKER_CAP', '1').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _machine_info():
+    cpu = os.cpu_count() or 1
+    try:
+        import psutil
+        total_mb = psutil.virtual_memory().total / (1024 * 1024)
+    except Exception:
+        total_mb = float(os.getenv('ASSUMED_RAM_MB', '2048'))
+    return cpu, total_mb
+
+
+def _auto_worker_cap():
+    """Accounts/worker the machine can safely hold: spread usable RAM across
+    ~1 worker per CPU core. One process ≈ one core (GIL), so cores cap parallelism
+    and RAM caps total accounts."""
+    cpu, total_mb = _machine_info()
+    usable = max(0.0, total_mb - RAM_RESERVE_MB)
+    cap = int((usable / PER_ACCOUNT_MB) / max(1, cpu))
+    return max(WORKER_CAP_MIN, min(WORKER_CAP_MAX, cap))
+
+
+if _AUTO_WORKER_CAP:
+    # Use the smaller of the configured baseline (100) and what the box can handle.
+    MAX_ACCOUNTS_PER_WORKER = max(WORKER_CAP_MIN, min(_CONFIGURED_CAP, _auto_worker_cap()))
+else:
+    MAX_ACCOUNTS_PER_WORKER = _CONFIGURED_CAP
+
 PER_IP_CAP = int(os.getenv('PER_IP_CAP', '40'))
 MIN_WORKERS = int(os.getenv('MIN_WORKERS', '1'))
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', '16'))
@@ -221,8 +258,10 @@ def main():
 
     print("=" * 50)
     print("Jiren Ads Bot — Auto-Scaling Manager")
-    print(f"cap/worker={MAX_ACCOUNTS_PER_WORKER} per_ip_cap={PER_IP_CAP} "
-          f"workers[{MIN_WORKERS}..{MAX_WORKERS}] interval={MANAGER_INTERVAL}s")
+    _cpu, _ram = _machine_info()
+    _how = "auto" if _AUTO_WORKER_CAP else "fixed"
+    print(f"machine: {_cpu} CPU, {_ram/1024:.1f} GB RAM | cap/worker={MAX_ACCOUNTS_PER_WORKER} ({_how}, baseline {_CONFIGURED_CAP})")
+    print(f"per_ip_cap={PER_IP_CAP} workers[{MIN_WORKERS}..{MAX_WORKERS}] interval={MANAGER_INTERVAL}s")
     print("=" * 50)
 
     _ensure_bot_alive()

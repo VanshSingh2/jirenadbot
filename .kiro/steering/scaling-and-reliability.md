@@ -261,3 +261,22 @@ On top of that, every account client now has:
 If timeouts persist after this, the remaining causes are external: too many
 connections per IP (add proxies), an overloaded box (add workers / lower
 `MAX_ACCOUNTS_PER_WORKER`), or a flaky host network.
+
+
+
+## Auto per-worker cap (CPU/RAM aware)
+
+The manager auto-sizes `MAX_ACCOUNTS_PER_WORKER` from the machine:
+
+    usable_RAM = total_RAM − RAM_RESERVE_MB
+    auto_cap   = (usable_RAM / PER_ACCOUNT_MB) / CPU_cores   # ~1 worker per core
+    effective  = clamp(min(baseline=100, auto_cap), WORKER_CAP_MIN, WORKER_CAP_MAX)
+
+- **Baseline is 100** accounts/worker. Auto only **lowers** it on constrained
+  boxes (it never raises above the configured baseline unless you raise
+  `MAX_ACCOUNTS_PER_WORKER` yourself).
+- RAM is per-account (≈15 MB), so it caps total accounts; cores cap parallelism
+  (one process ≈ one core). The formula spreads RAM across ~1 worker/core.
+- Examples: 8 GB / 4-core → ~100; 4 GB / 2-core → ~100; a constrained box →
+  auto-lowers (e.g., 31). Set `AUTO_WORKER_CAP=0` + `MAX_ACCOUNTS_PER_WORKER=N`
+  to force a fixed value. The boot log prints the machine specs and chosen cap.
