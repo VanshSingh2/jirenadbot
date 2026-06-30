@@ -3,9 +3,19 @@
 *.pyo
 *.pyd
 
+# Virtual environments / local libs
+.Python
+env/
+venv/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+Lib/
+Lib64/
+Scripts/
+
+# Local sessions
 **/session/
 *.session
 *.session-journal
-encryption.key
-GOKU ADS BOT/config.py
-.env
