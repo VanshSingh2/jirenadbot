@@ -238,3 +238,26 @@ Frequency is no longer user-settable. It's a single global value
 - Only admins change it: `/freq <1-3>` or Interval Settings → 🎯 (admin only).
 - Regular users just see "Frequency: ~3/hour per group (managed by admin)".
 - Recommended rollout: set `/freq 2` to test, then `/freq 3`.
+
+
+
+## Telegram connection timeouts / disconnects — causes & mitigations
+
+The #1 cause of "connection timeout / websocket disconnect" in this bot was the
+**synchronous Mongo driver blocking the event loop**: while a DB call ran,
+Telethon couldn't service its socket (read data / send pings), so Telegram
+dropped the connection and the next request timed out. That root cause is fixed
+(caches, thread-offloaded DB, no per-send writes, capped accounts/worker).
+
+On top of that, every account client now has:
+- `connection_retries=None`, `retry_delay=5`, `auto_reconnect=True`,
+  `request_retries=5`, and `timeout=TG_TIMEOUT` (30s).
+- A **per-round connection watchdog** that reconnects if `is_connected()` is false.
+- **Round-level handling of `asyncio.TimeoutError` / `ConnectionError` / `OSError`**:
+  the loop backs off 15s and retries the round (keeps the client) instead of
+  crashing — so a transient timeout never stops an account.
+- `MIN_MSG_DELAY=5` floor so an account can't burst 100 groups in seconds.
+
+If timeouts persist after this, the remaining causes are external: too many
+connections per IP (add proxies), an overloaded box (add workers / lower
+`MAX_ACCOUNTS_PER_WORKER`), or a flaky host network.

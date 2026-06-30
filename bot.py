@@ -1123,6 +1123,7 @@ _CLIENT_RESILIENCE_KW = dict(
     auto_reconnect=True,
     request_retries=5,
     flood_sleep_threshold=60,
+    timeout=int(os.getenv('TG_TIMEOUT', '30')),  # connect/request timeout (default Telethon is 10s)
 )
 
 
@@ -1149,6 +1150,9 @@ START_BATCH = int(os.getenv('START_BATCH', '25'))
 MAX_ACCOUNTS_PER_WORKER = int(os.getenv('MAX_ACCOUNTS_PER_WORKER', '0'))
 # Minimum pause between rounds when target-frequency pacing is on.
 TARGET_MIN_CYCLE_FLOOR = int(os.getenv('TARGET_MIN_CYCLE_FLOOR', '30'))
+# Hard floor for per-message delay (anti-burst safety; prevents flooding 100 groups
+# in seconds even when the cadence is capped). Applies even to old stored values.
+MIN_MSG_DELAY = int(os.getenv('MIN_MSG_DELAY', '5'))
 # Live per-send logging: OFF by default (round summaries already report results).
 # Turn ON (LIVE_SEND_LOGS=1) only at small scale; per-send logger calls do not
 # scale (a bot FloodWaits past ~30 msgs/sec).
@@ -1592,6 +1596,17 @@ async def run_forwarding_loop(user_id, account_id):
         while True:
             try:
                 round_num += 1
+                # Connection watchdog: if the link dropped (timeout/network), bring it
+                # back before doing work. auto_reconnect usually handles this; this is a
+                # belt-and-suspenders check that prevents "stuck disconnected" loops.
+                if not client.is_connected():
+                    try:
+                        await client.connect()
+                        print(f"[FORWARDING] Reconnected account {account_id}")
+                    except Exception as e:
+                        print(f"[FORWARDING] Reconnect failed {account_id}: {str(e)[:80]}; retrying")
+                        await asyncio.sleep(15)
+                        continue
                 acc = await db_call(accounts_col.find_one, {'_id': account_id})
                 if not acc or not acc.get('is_forwarding'):
                     print(f"[FORWARDING] Account {account_id} stopped")
@@ -1611,6 +1626,13 @@ async def run_forwarding_loop(user_id, account_id):
                     interval_data = INTERVAL_PRESETS.get(preset, INTERVAL_PRESETS['medium'])
                     msg_delay = interval_data.get('msg_delay', tier_settings['msg_delay'])
                     round_delay = interval_data.get('round_delay', tier_settings['round_delay'])
+                
+                # Safety floor: never burst faster than MIN_MSG_DELAY between sends,
+                # even if an old/custom value is lower.
+                try:
+                    msg_delay = max(MIN_MSG_DELAY, int(msg_delay))
+                except Exception:
+                    msg_delay = MIN_MSG_DELAY
                 
                 # ===================== Ads Source (Ads Mode) =====================
                 ads_mode = user.get('ads_mode', 'saved')
@@ -2100,6 +2122,17 @@ async def run_forwarding_loop(user_id, account_id):
             except asyncio.CancelledError:
                 print(f"[FORWARDING] Task cancelled for account {account_id}")
                 break
+            except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+                # Transient network / Telegram connection timeout: keep the client,
+                # back off briefly and retry next round (auto_reconnect + the round-start
+                # check recover the link) instead of tearing the whole loop down.
+                print(f"[FORWARDING] Connection issue for {account_id}: {type(e).__name__}: {str(e)[:80]} - retrying")
+                await asyncio.sleep(15)
+                continue
+            except Exception as e:
+                print(f"[FORWARDING] Round error for {account_id}: {type(e).__name__}: {str(e)[:120]} - retrying")
+                await asyncio.sleep(15)
+                continue
         
     except asyncio.CancelledError:
         print(f"[FORWARDING] Task cancelled for account {account_id}")
@@ -5103,7 +5136,7 @@ async def callback(event):
                 return
             user_states[uid] = {'action': 'custom_interval', 'step': 'msg_delay'}
             await event.edit(
-                "⏱️ Custom Interval\n\nEnter message delay in seconds (1-9999):",
+                "⏱️ Custom Interval\n\nEnter message delay in seconds (5-9999):",
                 buttons=[[Button.inline("← Back", b"menu_interval")]]
             )
             return
@@ -6370,7 +6403,7 @@ async def callback(event):
             await event.edit(
                 "<b>Admin: Custom Interval</b>\n\n"
                 f"<b>User ID:</b> <code>{target_id}</code>\n\n"
-                "Enter message delay in seconds (1-9999):",
+                "Enter message delay in seconds (5-9999):",
                 parse_mode='html',
                 buttons=[[Button.inline("Back", f"admin_settings_interval_{target_id}_{source}")]]
             )
@@ -8282,8 +8315,8 @@ async def text_handler(event):
             return
 
         if step == 'msg_delay':
-            if val < 1 or val > 9999:
-                await event.respond("Enter a value between 1-9999:")
+            if val < 5 or val > 9999:
+                await event.respond("Enter a value between 5-9999:")
                 return
             user_states[uid]['msg_delay'] = val
             user_states[uid]['step'] = 'round_delay'
@@ -8385,8 +8418,8 @@ async def text_handler(event):
             return
         
         if step == 'msg_delay':
-            if val < 1 or val > 9999:
-                await event.respond("Enter a value between 1-9999:")
+            if val < 5 or val > 9999:
+                await event.respond("Enter a value between 5-9999:")
                 return
             user_states[uid]['msg_delay'] = val
             user_states[uid]['step'] = 'round_delay'
