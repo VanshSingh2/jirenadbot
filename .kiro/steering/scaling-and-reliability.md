@@ -330,3 +330,28 @@ human action (proxies). All thresholds are env-tunable.
    reconciler/health queries.
 5. **Process-level restarts** still need a supervisor (systemd `Restart=always`
    or Docker `restart: unless-stopped`) in front of `manager.py`.
+
+
+
+## Hardening pass 2 (implemented)
+
+- **Logging via HTTP Bot API** (`_tg_send_http`): `send_log` and stop-logs now post
+  to `api.telegram.org` in a worker thread. Workers no longer start a logger
+  Telethon client (no shared-token / getUpdates conflict). The logger Telethon
+  client runs ONLY on the UI process for its incoming `/start` link handler.
+- **Per-round/error DB writes offloaded** (`update_account_stats`, `set_flood_wait`,
+  `mark_group_failed`) via `db_call` so they never block the event loop.
+- **Docker**: `Dockerfile` + `docker-compose.yml` run `manager.py` with
+  `restart: unless-stopped` (covers process/host crashes — item #5). Sessions
+  persist via the `./session` volume.
+- **`ENCRYPTION_KEY` env**: stored sessions can be decrypted from a stable env key
+  (set it once and keep it constant) instead of a file — clean for containers/secrets.
+
+### Deliberately NOT changed
+- **Consistent-hashing live rebalance (#3):** kept the safe modulo + coordinated
+  restart. A live rebalance based on heartbeats risks two workers briefly owning
+  the same account → double-send → exactly the FloodWait/ban we avoid. The brief,
+  rare, cooldown-gated restart pause is the safer trade-off at this scale.
+- **Async UI handlers (#2):** the UI bot runs as its own process, so its
+  synchronous Mongo only affects UI responsiveness, never forwarding. A full
+  async migration of the ~7k-line handler is high-risk for low gain here.

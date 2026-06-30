@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__/
+**/__pycache__/
+*.pyc
+.env
+.env.local
+session/
+*.session
+*.session-journal
+.venv/
+venv/
+encryption.key

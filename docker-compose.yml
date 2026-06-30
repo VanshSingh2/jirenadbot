@@ -1,0 +1,28 @@
+# Single-box deployment. `manager.py` runs the UI bot + auto-scaled workers
+# inside this one container; `restart: unless-stopped` covers process/host crashes.
+#
+# Before first run:
+#   1) cp .env.example .env  and fill in real values (rotate the leaked tokens!)
+#   2) set ENCRYPTION_KEY in .env to a STABLE Fernet key (generate once:
+#        python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())")
+#      Keep it constant forever — changing it makes existing saved sessions undecryptable.
+#
+# To scale across machines later: run one container with BOT_ROLE=bot, and N
+# containers with BOT_ROLE=worker / WORKER_ID / WORKER_COUNT (one per box/IP set),
+# instead of the all-in-one manager.
+
+services:
+  jirenadbot:
+    build: .
+    image: jirenadbot:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./session:/app/session        # persist Telegram sessions
+    stop_grace_period: 30s
+    # Optional resource hints so the auto-cap math matches the box:
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "4"
+    #       memory: 8g

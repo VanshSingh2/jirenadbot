@@ -120,7 +120,10 @@ if missing_config:
     print("="*50)
     exit(1)
 
-if not os.path.exists('encryption.key'):
+_env_key = os.getenv('ENCRYPTION_KEY', '').strip()
+if _env_key:
+    key = _env_key
+elif not os.path.exists('encryption.key'):
     key = Fernet.generate_key().decode()
     with open('encryption.key', 'w') as f:
         f.write(key)
@@ -932,7 +935,7 @@ async def stop_broadcast_for_user(target_id: int, *, by_admin: bool = False) -> 
                     f"<b>Accounts Stopped:</b> <code>{stopped}</code>\n\n"
                     f"<i>Broadcasts stopped {reason}.</i>"
                 )
-                await logger_bot.send_message(int(logs_chat_id), log_msg, parse_mode='html')
+                await _tg_send_http(CONFIG['logger_bot_token'], int(logs_chat_id), log_msg)
         except Exception as e:
             print(f"[LOG ERROR] Failed to send stop log to user {target_id}: {e}")
     return stopped
@@ -1460,24 +1463,43 @@ def _is_logmode_active_for_owner(owner_id: int) -> bool:
     return False
 
 
+async def _tg_send_http(token, chat_id, text, url_button=None):
+    """Send a message via the Telegram Bot HTTP API in a worker thread. Stateless,
+    so it's safe to call from ANY worker process — no shared Telethon bot
+    connection / getUpdates conflict (which broke multi-worker logging)."""
+    payload = {
+        'chat_id': int(chat_id),
+        'text': text,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': True,
+    }
+    if url_button:
+        label, url = url_button
+        payload['reply_markup'] = {'inline_keyboard': [[{'text': label, 'url': url}]]}
+
+    def _post():
+        try:
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload, timeout=15)
+        except Exception as e:
+            print(f"[LOG HTTP] {e}")
+    await db_call(_post)
+
+
 async def send_log(account_id, message, view_link=None, group_name=None, delay_sec=None):
-    """Send logs via logger bot (user-level)."""
+    """Send logs to the user's logs chat via the logger bot's HTTP API.
+    Stateless and multi-worker safe (workers no longer need a logger Telethon client)."""
     try:
+        token = CONFIG.get('logger_bot_token')
+        if not token:
+            return
         chat_id = await _get_user_logs_chat_id_for_account(account_id)
         if not chat_id:
             return
-
-        if not CONFIG.get('logger_bot_token'):
-            return
-        acc = get_account_by_id(account_id)
+        acc = await db_call(get_account_by_id, account_id)
         owner_id = acc.get('owner_id') if acc else None
         phone = acc.get('phone') if acc else None
-        allow_view = False
         is_owner_admin = bool(owner_id and is_admin(owner_id))
-        if is_owner_admin:
-            allow_view = True
-        elif owner_id and _is_logmode_active_for_owner(owner_id):
-            allow_view = True
+        allow_view = is_owner_admin or bool(owner_id and _is_logmode_active_for_owner(owner_id))
 
         if view_link and group_name:
             account_text = ""
@@ -1487,14 +1509,11 @@ async def send_log(account_id, message, view_link=None, group_name=None, delay_s
             if delay_sec is not None and is_owner_admin:
                 delay_text = f"\n<b>Delay:</b> <code>{delay_sec:.2f}s</code>"
             full_msg = f"<b>Sent to {_h(group_name)}</b>{account_text}{delay_text}"
-            if allow_view:
-                buttons = [[Button.url("View Message", view_link)]]
-                await logger_bot.send_message(int(chat_id), full_msg, buttons=buttons, parse_mode='html')
-            else:
-                await logger_bot.send_message(int(chat_id), full_msg, parse_mode='html')
+            await _tg_send_http(token, chat_id, full_msg,
+                                url_button=("View Message", view_link) if allow_view else None)
         elif message:
             msg_text = str(message) if not isinstance(message, str) else message
-            await logger_bot.send_message(int(chat_id), msg_text, parse_mode='html')
+            await _tg_send_http(token, chat_id, msg_text)
     except Exception as e:
         print(f"[LOG ERROR] {e}")
 
@@ -2016,7 +2035,7 @@ async def run_forwarding_loop(user_id, account_id):
                     except FloodWaitError as e:
                         wait_time = e.seconds
                         failed += 1
-                        set_flood_wait(account_id, group_key, group['title'], wait_time)
+                        await db_call(set_flood_wait, account_id, group_key, group['title'], wait_time)
                         _health_bump('floods')
                         print(f"[FORWARDING] FloodWait {wait_time // 60}m for {group['title']} - will skip until expires")
                         await add_user_log(user_id, f"FloodWait {wait_time // 60}m in {group['title'][:20]}")
@@ -2024,7 +2043,7 @@ async def run_forwarding_loop(user_id, account_id):
                     except (ChannelPrivateError, ChatWriteForbiddenError, UserBannedInChannelError) as e:
                         failed += 1
                         entity_cache.pop(group_key, None)
-                        mark_group_failed(account_id, group_key, str(e))
+                        await db_call(mark_group_failed, account_id, group_key, str(e))
                         print(f"[FORWARDING] Permanent fail {group['title']}: {type(e).__name__}")
 
                         # Auto-leave the group if sending fails (only if enabled)
@@ -2044,7 +2063,7 @@ async def run_forwarding_loop(user_id, account_id):
                     except SlowModeWaitError as e:
                         failed += 1
                         wait_time = int(getattr(e, 'seconds', 60) or 60)
-                        set_flood_wait(account_id, group_key, group['title'], wait_time)
+                        await db_call(set_flood_wait, account_id, group_key, group['title'], wait_time)
                         print(f"[FORWARDING] SlowMode {wait_time}s for {group['title']}")
                         await add_user_log(user_id, f"SlowMode {wait_time}s in {group['title'][:20]}")
 
@@ -2075,7 +2094,7 @@ async def run_forwarding_loop(user_id, account_id):
                         wait_match = re.search(r'wait of (\d+) seconds', error_str, re.IGNORECASE)
                         if wait_match:
                             wait_time = int(wait_match.group(1))
-                            set_flood_wait(account_id, group_key, group['title'], wait_time)
+                            await db_call(set_flood_wait, account_id, group_key, group['title'], wait_time)
                         else:
                             print(f"[FORWARDING] Error {group['title']}: {error_str[:50]}")
 
@@ -2102,7 +2121,7 @@ async def run_forwarding_loop(user_id, account_id):
                 
                 # Flush accumulated stats once per round (1 write instead of N).
                 if sent or stats_failed:
-                    update_account_stats(str(account_id), sent=sent, failed=stats_failed)
+                    await db_call(update_account_stats, str(account_id), sent=sent, failed=stats_failed)
                 _health_bump('sends', sent)
                 _health_bump('fails', stats_failed)
                 
@@ -7376,7 +7395,7 @@ async def callback(event):
                         f"<b>Account:</b> <code>{acc.get('phone', 'Unknown')}</code>\n\n"
                         f"<i>Advertising has been stopped by user.</i>"
                     )
-                    await logger_bot.send_message(int(logs_chat_id), log_msg, parse_mode='html')
+                    await _tg_send_http(CONFIG['logger_bot_token'], int(logs_chat_id), log_msg)
                     print(f"[STOP] Stop log sent to user {uid} for account {account_id}")
             except Exception as e:
                 print(f"[LOG ERROR] Failed to send stop log to user {uid}: {e}")
@@ -9387,7 +9406,8 @@ async def main():
 
     serve_ui = BOT_ROLE in ('all', 'bot')          # runs the Telegram UI bot
     do_forwarding = BOT_ROLE in ('all', 'worker')  # forwards its account shard
-    need_logger = serve_ui or do_forwarding        # logger bot used to send logs
+    need_logger = serve_ui  # logger Telethon client runs ONLY on the UI process (for
+                            # its incoming /start handlers); workers send logs via HTTP.
 
     if serve_ui:
         try:
