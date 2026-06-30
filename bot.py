@@ -207,9 +207,16 @@ for _name in ('main_bot', 'logger_bot'):
             pass
 
 # Point Telethon at the session base path (Telethon adds .session)
-main_bot = TelegramClient(os.path.join(SESSION_DIR, 'main_bot'), CONFIG['api_id'], CONFIG['api_hash'])
-logger_bot = TelegramClient(os.path.join(SESSION_DIR, 'logger_bot'), CONFIG['api_id'], CONFIG['api_hash'])
-notification_bot = TelegramClient(os.path.join(SESSION_DIR, 'notification_bot'), CONFIG['api_id'], CONFIG['api_hash'])
+_BOT_CLIENT_KW = dict(
+    connection_retries=None,   # keep retrying connection forever
+    retry_delay=5,
+    auto_reconnect=True,       # survive transient network drops without dying
+    request_retries=5,
+    flood_sleep_threshold=60,
+)
+main_bot = TelegramClient(os.path.join(SESSION_DIR, 'main_bot'), CONFIG['api_id'], CONFIG['api_hash'], **_BOT_CLIENT_KW)
+logger_bot = TelegramClient(os.path.join(SESSION_DIR, 'logger_bot'), CONFIG['api_id'], CONFIG['api_hash'], **_BOT_CLIENT_KW)
+notification_bot = TelegramClient(os.path.join(SESSION_DIR, 'notification_bot'), CONFIG['api_id'], CONFIG['api_hash'], **_BOT_CLIENT_KW)
 
 # ===================== Global Text Styling =====================
 # Telegram doesn't allow changing the app UI font, but we can stylize outgoing
@@ -841,7 +848,7 @@ async def start_broadcast_for_user(target_id: int) -> int:
         print(f"[ADS DEBUG] has_groups={has_groups}")
         accounts_col.update_one({'_id': acc['_id']}, {'$set': {'is_forwarding': True}})
         if acc['_id'] not in forwarding_tasks or forwarding_tasks[acc['_id']].done():
-            task = asyncio.create_task(run_forwarding_loop(target_id, acc['_id']))
+            task = asyncio.create_task(supervise_forwarding(target_id, acc['_id']))
             forwarding_tasks[acc['_id']] = task
             status_msg = " (⚠️ No groups configured!)" if not has_groups else ""
             print(f"[ADS] Started forwarding task for account {acc['_id']}{status_msg}")
@@ -1349,11 +1356,33 @@ async def run_forwarding_loop(user_id, account_id):
             return
         
         session = cipher_suite.decrypt(acc['session'].encode()).decode()
-        client = TelegramClient(StringSession(session), CONFIG['api_id'], CONFIG['api_hash'])
+        client = TelegramClient(
+            StringSession(session), CONFIG['api_id'], CONFIG['api_hash'],
+            connection_retries=None,    # retry connecting forever (survive network blips)
+            retry_delay=5,              # wait between connection retries
+            auto_reconnect=True,        # transparently reconnect if the link drops
+            request_retries=5,          # retry individual API calls a few times
+            flood_sleep_threshold=60,   # auto-sleep small floods instead of raising
+        )
         await client.connect()
         
         if not await client.is_user_authorized():
-            print(f"[FORWARDING] Account {account_id} not authorized")
+            print(f"[FORWARDING] Account {account_id} not authorized - disabling")
+            try:
+                accounts_col.update_one(
+                    {'_id': account_id},
+                    {'$set': {'is_forwarding': False, 'auth_invalid': True}}
+                )
+            except Exception:
+                pass
+            try:
+                await send_log(
+                    account_id,
+                    "<b>⚠ Session no longer authorized</b>\n\n"
+                    "<i>Forwarding stopped for this account. Please re-login to continue.</i>"
+                )
+            except Exception:
+                pass
             return
         
         print(f"[FORWARDING] Client connected for account {account_id}")
@@ -1404,7 +1433,7 @@ async def run_forwarding_loop(user_id, account_id):
         while True:
             try:
                 round_num += 1
-                acc = accounts_col.find_one({'_id': account_id})
+                acc = await db_call(accounts_col.find_one, {'_id': account_id})
                 if not acc or not acc.get('is_forwarding'):
                     print(f"[FORWARDING] Account {account_id} stopped")
                     break
@@ -1522,10 +1551,27 @@ async def run_forwarding_loop(user_id, account_id):
                 
                 acc_id_str = str(account_id)
                 
+                # Preload per-account failure + flood-wait state ONCE per round so we
+                # don't fire a blocking DB query for every single group (this was a
+                # major source of event-loop blocking for accounts with many groups).
+                _now = datetime.now()
+                failed_set = set()
+                flood_map = {}
+                try:
+                    def _load_round_state():
+                        fset = {d.get('group_key') for d in account_failed_groups_col.find(
+                            {'account_id': acc_id_str}, {'group_key': 1})}
+                        fmap = {d.get('group_key'): d.get('wait_until') for d in account_flood_waits_col.find(
+                            {'account_id': account_id, 'wait_until': {'$gt': _now}}, {'group_key': 1, 'wait_until': 1})}
+                        return fset, fmap
+                    failed_set, flood_map = await db_call(_load_round_state)
+                except Exception as _e:
+                    print(f"[FORWARDING] Preload round state failed: {_e}")
+                
                 if fwd_mode in ('topics', 'both'):
-                    topic_groups = list(account_topics_col.find({'account_id': acc_id_str}))
+                    topic_groups = await db_call(lambda: list(account_topics_col.find({'account_id': acc_id_str})))
                     if not topic_groups:
-                        topic_groups = list(account_topics_col.find({'account_id': {'$in': _account_id_variants(account_id)}}))
+                        topic_groups = await db_call(lambda: list(account_topics_col.find({'account_id': {'$in': _account_id_variants(account_id)}})))
                     
                     for tg in topic_groups:
                         link = tg.get('link') or tg.get('url')
@@ -1534,7 +1580,7 @@ async def run_forwarding_loop(user_id, account_id):
                                 link = link.split('?')[0]
                             peer, url, topic_id = parse_link(link)
                             group_key = link
-                            if not is_group_failed(acc_id_str, group_key):
+                            if group_key not in failed_set:
                                 groups_to_forward.append({
                                     'peer': peer,
                                     'url': url,
@@ -1548,13 +1594,13 @@ async def run_forwarding_loop(user_id, account_id):
                 if fwd_mode in ('auto', 'both'):
                     auto_limit = get_user_auto_group_limit(user_id)
                     count = 0
-                    auto_groups = account_auto_groups_col.find(
+                    auto_groups = await db_call(lambda: list(account_auto_groups_col.find(
                         {'account_id': {'$in': _account_id_variants(account_id)}}
-                    ).sort('_id', 1)
+                    ).sort('_id', 1)))
                     
                     for ag in auto_groups:
                         group_key = str(ag['group_id'])
-                        if not is_group_failed(acc_id_str, group_key):
+                        if group_key not in failed_set:
                             groups_to_forward.append({
                                 'group_id': ag['group_id'],
                                 'access_hash': ag.get('access_hash'),
@@ -1587,7 +1633,7 @@ async def run_forwarding_loop(user_id, account_id):
                     # 10th group instead of every group avoids hundreds of blocking
                     # queries per round when an account has many groups.
                     if i % 10 == 0:
-                        fresh_acc = accounts_col.find_one({'_id': account_id})
+                        fresh_acc = await db_call(accounts_col.find_one, {'_id': account_id})
                         if not fresh_acc or not fresh_acc.get('is_forwarding'):
                             break
                         acc = fresh_acc
@@ -1610,10 +1656,11 @@ async def run_forwarding_loop(user_id, account_id):
                             break
                     
                     group_key = group.get('key', group.get('title', 'unknown'))
-                    wait_remaining = get_flood_wait(account_id, group_key)
-                    if wait_remaining > 0:
+                    _wait_until = flood_map.get(group_key)
+                    if _wait_until and _wait_until > datetime.now():
                         skipped += 1
-                        print(f"[FORWARDING] Skipped {group['title']} (flood wait: {wait_remaining // 60}m)")
+                        remaining_m = int((_wait_until - datetime.now()).total_seconds()) // 60
+                        print(f"[FORWARDING] Skipped {group['title']} (flood wait: {remaining_m}m)")
                         continue
                     
                     msg = ads[i % len(ads)] if ads_mode == 'saved' else None
@@ -1889,8 +1936,78 @@ async def run_forwarding_loop(user_id, account_id):
                 print(f"[FORWARDING] Client disconnected for account {account_id}")
             except:
                 pass
+        # NOTE: task registration in forwarding_tasks is owned by supervise_forwarding,
+        # which calls this loop. Do not delete it here or the supervisor loses track.
+
+async def supervise_forwarding(user_id, account_id):
+    """Keep an account's forwarding loop alive in production.
+
+    - Restarts run_forwarding_loop with exponential backoff if it crashes
+      unexpectedly (network/Telegram errors), so an account never silently stops.
+    - Stops cleanly when forwarding is turned off, the task is cancelled, or the
+      session becomes unauthorized (run_forwarding_loop clears is_forwarding).
+    This is the task registered in forwarding_tasks; cancelling it cancels the
+    whole chain instantly."""
+    backoff = 5
+    try:
+        while True:
+            acc = await db_call(get_account_by_id, account_id)
+            if not acc or not acc.get('is_forwarding', False):
+                break
+            started_at = time.monotonic()
+            try:
+                await run_forwarding_loop(user_id, account_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[SUPERVISOR] Account {account_id} crashed: {e}")
+                import traceback
+                traceback.print_exc()
+            # If it ran for a healthy while, reset the backoff.
+            if time.monotonic() - started_at > 120:
+                backoff = 5
+            # Decide whether to restart.
+            acc = await db_call(get_account_by_id, account_id)
+            if not acc or not acc.get('is_forwarding', False):
+                break
+            print(f"[SUPERVISOR] Restarting account {account_id} in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+    except asyncio.CancelledError:
+        print(f"[SUPERVISOR] Cancelled for account {account_id}")
+    finally:
         if account_id in forwarding_tasks:
             del forwarding_tasks[account_id]
+
+
+async def resume_active_forwarding():
+    """On startup, resume any accounts that were forwarding before the restart.
+    Staggered so we don't reconnect hundreds of sessions all at once."""
+    try:
+        active = await db_call(lambda: list(accounts_col.find({'is_forwarding': True})))
+    except Exception as e:
+        print(f"[RESUME] Could not query active accounts: {e}")
+        return
+    if not active:
+        print("[RESUME] No active accounts to resume")
+        return
+    print(f"[RESUME] Resuming {len(active)} account(s)...")
+    stagger = float(os.getenv('RESUME_STAGGER_SECONDS', '2'))
+    resumed = 0
+    for acc in active:
+        acc_id = acc['_id']
+        owner_id = acc.get('owner_id')
+        if owner_id is None:
+            continue
+        existing = forwarding_tasks.get(acc_id)
+        if existing and not existing.done():
+            continue
+        task = asyncio.create_task(supervise_forwarding(owner_id, acc_id))
+        forwarding_tasks[acc_id] = task
+        resumed += 1
+        await asyncio.sleep(stagger)
+    print(f"[RESUME] Started {resumed} forwarding supervisor(s)")
+
 
 async def forward_message(client, to_entity, msg_id, from_peer, topic_id=None):
     random_id = random.randint(1, 2147483647)
@@ -9278,6 +9395,20 @@ async def handle_notification_actions(event):
     elif data == "notif_cancel":
         await event.delete()
 
+def _loop_exception_handler(loop, context):
+    """Keep the bot alive on stray background-task errors instead of letting an
+    unhandled exception take down the event loop."""
+    msg = context.get("exception", context.get("message"))
+    print(f"[LOOP ERROR] Unhandled exception in background task: {msg}")
+    try:
+        exc = context.get("exception")
+        if exc:
+            import traceback
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
+    except Exception:
+        pass
+
+
 async def main():
     print("\n" + "="*50)
     print("Starting Jiren Ads Bot...")
@@ -9324,7 +9455,19 @@ async def main():
     print("="*50)
     print("Bot running!")
     print("="*50 + "\n")
-    
+
+    # Log (don't crash on) any unhandled exception from background tasks.
+    try:
+        asyncio.get_running_loop().set_exception_handler(_loop_exception_handler)
+    except Exception as e:
+        print(f"[INIT] Could not set loop exception handler: {e}")
+
+    # Resume forwarding for accounts that were active before this (re)start.
+    try:
+        await resume_active_forwarding()
+    except Exception as e:
+        print(f"[RESUME] Failed: {e}")
+
     await asyncio.gather(
         main_bot.run_until_disconnected(),
         logger_bot.run_until_disconnected() if CONFIG['logger_bot_token'] else asyncio.sleep(0),
@@ -10196,7 +10339,12 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("\nStopped")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"[FATAL] Bot exited with error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
-        mongo_client.close()
+        try:
+            mongo_client.close()
+        except Exception:
+            pass
 

@@ -83,3 +83,38 @@ Tunables (env vars): `MONGO_MAX_POOL`, `MONGO_SERVER_SELECTION_MS`,
 - Latent `NameError`s exist in some legacy paths (e.g. an undefined `settings`
   in the legacy `forwarder_loop` auto-reply setup, an undefined `plan_id` in a
   callback). These predate the perf work and should be triaged.
+
+
+## Production hardening (now implemented on main)
+
+These were added on top of the perf fixes to keep the bot up and self-healing:
+
+- **Telethon connection resilience** on every client (forwarding accounts + the
+  3 bots): `connection_retries=None`, `retry_delay`, `auto_reconnect=True`,
+  `request_retries`, `flood_sleep_threshold=60`. Transient network drops and
+  small floods are handled automatically instead of crashing a loop.
+- **Per-account supervisor** (`supervise_forwarding`): the task registered in
+  `forwarding_tasks` is now the supervisor, which restarts the forwarding loop
+  with exponential backoff (cap 5 min) if it crashes, and stops cleanly on
+  cancel / when `is_forwarding` is cleared / when the session is unauthorized.
+- **Startup resume** (`resume_active_forwarding`): on boot, accounts still marked
+  `is_forwarding=true` are resumed, staggered (`RESUME_STAGGER_SECONDS`, default
+  2s) to avoid a reconnect storm.
+- **Unauthorized sessions** auto-disable themselves (`is_forwarding=false`,
+  `auth_invalid=true`) and notify, instead of dying silently.
+- **Loop exception handler** logs stray background-task errors instead of letting
+  them take down the event loop; fatal exits print a full traceback.
+- **Per-round DB preloading**: failed-group set and flood-wait map are loaded
+  once per round (in a worker thread) instead of one query per group; the hot
+  per-round account/group reads use the `db_call` thread-offload helper.
+
+### Still recommended for true 1000+ scale
+
+- **Run under a process manager** (systemd `Restart=always`, or Docker
+  `restart: unless-stopped` / Kubernetes). In-process supervision covers task
+  crashes; a process manager covers process-level crashes and OOM. This is the
+  standard production setup and intentionally not reimplemented in-process
+  (the Telethon clients are module-level and bound to one event loop).
+- **Shard accounts across worker processes** once you outgrow a single loop.
+- **Full `motor` async migration** for the remaining synchronous call sites
+  outside the forwarding hot path (command handlers).
