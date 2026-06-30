@@ -211,3 +211,22 @@ or banned no matter how many workers/IPs you have. This is per-account behavior,
 not hardware. Safer patterns: larger `msg_delay`, fewer groups per round, or
 rotating which groups each round targets. Treat 5s/100-groups as the aggressive
 end and expect account churn there.
+
+
+## Target-frequency pacing (set sends/hour per group)
+
+Cycle delay is the pause *after* a full round; the real per-group interval is
+`groups × msg_delay + cycle_delay`. With 100 groups × 5s, a round alone is ~8 min,
+so tuning raw cycle delay is unintuitive.
+
+Instead, users can set a **target frequency** — "message each group N times/hour":
+- UI: Interval Settings → **🎯 Times/Hour per Group**, or command **`/freq <n>`** (0 = off).
+- The forwarding loop auto-computes `round_delay = (3600/N) − groups×msg_delay`
+  per account, so different group counts still hit ~N/hour.
+- If an account has too many groups to reach N/hour even at full speed, it runs
+  as fast as it safely can and the round-complete log shows a warning with the
+  achievable rate.
+
+Recommended **2–3/hour per group** — far safer for the accounts than the ~6–7/hr
+that 5s/100-groups produces by default. Stored as `target_per_hour` on the user;
+`0`/unset falls back to the interval preset's fixed cycle delay.

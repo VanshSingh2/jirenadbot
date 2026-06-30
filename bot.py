@@ -1108,6 +1108,8 @@ START_BATCH = int(os.getenv('START_BATCH', '25'))
 # uses this to decide how many workers to spawn; the reconciler enforces it so a
 # worker never overloads its event loop / IP.
 MAX_ACCOUNTS_PER_WORKER = int(os.getenv('MAX_ACCOUNTS_PER_WORKER', '0'))
+# Minimum pause between rounds when target-frequency pacing is on.
+TARGET_MIN_CYCLE_FLOOR = int(os.getenv('TARGET_MIN_CYCLE_FLOOR', '30'))
 # Live per-send logging: OFF by default (round summaries already report results).
 # Turn ON (LIVE_SEND_LOGS=1) only at small scale; per-send logger calls do not
 # scale (a bot FloodWaits past ~30 msgs/sec).
@@ -1738,6 +1740,29 @@ async def run_forwarding_loop(user_id, account_id):
                     await asyncio.sleep(60)
                     continue
                 
+                # ---- Target-frequency pacing -------------------------------
+                # If the user set a target (sends/hour per group), auto-compute the
+                # cycle delay so each group is messaged ~that often regardless of how
+                # many groups this account has.
+                n_groups = len(groups_to_forward)
+                est_round_send = n_groups * msg_delay  # seconds (approx; msg_delay dominates)
+                target_per_hour = user.get('target_per_hour') or 0
+                freq_note = ""
+                if target_per_hour and target_per_hour > 0:
+                    target_cycle = 3600.0 / target_per_hour
+                    round_delay = max(TARGET_MIN_CYCLE_FLOOR, int(target_cycle - est_round_send))
+                    achievable = 3600.0 / max(1.0, est_round_send + round_delay)
+                    if est_round_send + TARGET_MIN_CYCLE_FLOOR >= target_cycle:
+                        freq_note = (f" | WARN {n_groups} groups x {msg_delay}s = {est_round_send//60}m/round; "
+                                     f"max ~{achievable:.1f}/hr (below target {target_per_hour}/hr)")
+                    else:
+                        freq_note = f" | ~{achievable:.1f}/hr per group (target {target_per_hour}/hr)"
+                else:
+                    est_cycle = est_round_send + round_delay
+                    freq_note = f" | cycle ~{est_cycle//60}m (~{3600.0/max(1, est_cycle):.1f}/hr per group)"
+                print(f"[FORWARDING] {account_id}: {n_groups} groups, msg_delay={msg_delay}s, "
+                      f"round_delay={round_delay}s{freq_note}")
+
                 sent = 0
                 failed = 0
                 skipped = 0
@@ -2015,7 +2040,7 @@ async def run_forwarding_loop(user_id, account_id):
                 
                 print(f"[FORWARDING] Round complete. Sent: {sent}, Failed: {failed}, Skipped: {skipped}")
                 try:
-                    await send_log(account_id, f"<b>✅ Round {round_num} Completed</b>\n\n📤 <b>Sent:</b> <code>{sent}</code> | ❌ <b>Failed:</b> <code>{failed}</code> | ⏭ <b>Skipped:</b> <code>{skipped}</code>\n\n⏰ <b>Next Round:</b> <code>{round_delay}s</code>")
+                    await send_log(account_id, f"<b>✅ Round {round_num} Completed</b>\n\n📤 <b>Sent:</b> <code>{sent}</code> | ❌ <b>Failed:</b> <code>{failed}</code> | ⏭ <b>Skipped:</b> <code>{skipped}</code>\n\n⏰ <b>Next Round:</b> <code>{round_delay}s</code>{freq_note}")
                 except Exception:
                     pass
                 await add_user_log(user_id, f"Round: {sent} sent, {failed} failed, {skipped} skipped")
@@ -2927,9 +2952,12 @@ def interval_menu_keyboard(user_id):
         # Free plan: show button but mark as locked
         custom = Button.inline("Custom Timing 🔒", b"interval_locked")
 
+    freq_mark = " ✅" if user.get('target_per_hour') else ""
+    freq = Button.inline(f"🎯 Times/Hour per Group{freq_mark}", b"interval_freq")
     return [
         [slow, medium],
         [fast, custom],
+        [freq],
         [Button.inline("Back", b"menu_broadcast")],
     ]
 
@@ -3625,6 +3653,26 @@ async def cmd_health(event):
         f"<b>CPU:</b> <code>{cpu:.0f}%</code>"
     )
     await event.respond(text, parse_mode='html')
+
+
+@main_bot.on(events.NewMessage(pattern=r'^/freq(?:@[\w_]+)?\s+(\d+)$'))
+async def cmd_freq(event):
+    """Set how many times per hour each group should be messaged (per account).
+    0 = off (use the interval preset's cycle delay)."""
+    uid = event.sender_id
+    val = int(event.pattern_match.group(1))
+    if val < 0 or val > 12:
+        await event.respond("Usage: /freq <0-12>  (times per hour per group; 0 = off; 2-3 recommended)")
+        return
+    users_col.update_one({'user_id': uid}, {'$set': {'target_per_hour': val}}, upsert=True)
+    invalidate_user_cache(uid)
+    if val == 0:
+        await event.respond("🎯 Target frequency OFF (using your interval preset's cycle delay).")
+    else:
+        await event.respond(
+            f"🎯 Target set: ~{val}/hour per group.\n\n"
+            "The bot auto-adjusts each account's cycle delay from its group count."
+        )
 
 
 # /add command removed per user request (use dashboard Add Account button)
@@ -4974,6 +5022,9 @@ async def callback(event):
                     "<b>━━━━━━━━━━━━━━━━━━━━━━━━━</b>"
                 )
             
+            tph = user.get('target_per_hour') or 0
+            if tph:
+                text += f"\n\n🎯 <b>Target:</b> <code>~{tph}/hour per group</code> (auto cycle delay)"
             await event.edit(text, parse_mode='html', buttons=interval_menu_keyboard(uid))
             return
         
@@ -5018,6 +5069,14 @@ async def callback(event):
             user_states[uid] = {'action': 'custom_interval', 'step': 'msg_delay'}
             await event.edit(
                 "⏱️ Custom Interval\n\nEnter message delay in seconds (1-9999):",
+                buttons=[[Button.inline("← Back", b"menu_interval")]]
+            )
+            return
+
+        if data == "interval_freq":
+            user_states[uid] = {'action': 'set_target_freq'}
+            await event.edit(
+                "🎯 Target Frequency\n\nHow many times per hour should EACH group get a message (per account)?\n\nRecommended: 2-3 (safe). Enter 1-12, or 0 to turn off:",
                 buttons=[[Button.inline("← Back", b"menu_interval")]]
             )
             return
@@ -8257,6 +8316,27 @@ async def text_handler(event):
             text, buttons = admin_quiet_hours_menu(int(target_id), source)
             await respond_with_welcome(event, text, buttons=buttons)
             return
+
+    if action == 'set_target_freq':
+        try:
+            val = int(text)
+        except Exception:
+            await event.respond("Please enter a number (0-12).")
+            return
+        if val < 0 or val > 12:
+            await event.respond("Enter a number between 0 and 12 (0 = off).")
+            return
+        users_col.update_one({'user_id': uid}, {'$set': {'target_per_hour': val}}, upsert=True)
+        invalidate_user_cache(uid)
+        user_states.pop(uid, None)
+        if val == 0:
+            msg = "🎯 Target frequency OFF. Using your interval preset's cycle delay."
+        else:
+            msg = (f"🎯 Target set: ~{val}/hour per group.\n\n"
+                   f"The bot auto-adjusts each account's cycle delay from its group count. "
+                   f"If an account has too many groups to reach {val}/hr, it runs as fast as it safely can.")
+        await event.respond(msg, buttons=[[Button.inline("Back to Dashboard", b"enter_dashboard")]])
+        return
 
     if action == 'custom_interval':
         step = state.get('step')
