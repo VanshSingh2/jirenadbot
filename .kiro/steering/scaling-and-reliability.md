@@ -163,3 +163,51 @@ requirements) so MTProto AES runs in C — a major CPU saving at scale.
 ### Ops
 - `/health` (admin) and the periodic `[HEALTH]` log show role, worker, active
   accounts (local + DB), proxy count, uptime, RSS and CPU.
+
+
+## Auto-scaling manager (`manager.py`)
+
+For hands-off scaling on a single box, run `python manager.py` instead of
+`bot.py`. It:
+- keeps **1 UI bot** process (`BOT_ROLE=bot`) alive,
+- counts active forwarding accounts and runs
+  `ceil(active / MAX_ACCOUNTS_PER_WORKER)` **worker** processes (with hysteresis;
+  scales down only after `DOWN_STABLE_CYCLES` calm cycles),
+- respawns any process that dies,
+- **DMs the admin** (via the Telegram Bot API) when proxy/IP capacity is about to
+  run out — it cannot create proxies itself, so it tells you how many to add.
+
+New users/accounts are picked up automatically by the reconciler; the manager
+only adjusts the number of worker *processes*. Multi-machine elastic scaling is
+still out of scope (one manager per box, or use Kubernetes).
+
+Note: changing the worker count restarts the worker pool together (account
+ownership is `hash % WORKER_COUNT`), a brief reshuffle. `is_forwarding` flags
+persist, so workers immediately reclaim their accounts.
+
+## Capacity is bounded by SEND RATE, not account count
+
+A worker is one event loop. What saturates it is **aggregate sends/sec**, which
+depends on each account's `msg_delay`:
+
+    sends/sec per account  ≈ 1 / msg_delay
+    accounts per worker    ≈ target_sends_per_sec / (1 / msg_delay)
+
+With `cryptg` and the trimmed per-send path, target ~30 sends/sec/worker safely
+(~50 ceiling). Examples: `msg_delay=5s` ⇒ ~150 accounts/worker; `msg_delay=30s`
+⇒ the worker is limited by RAM/IP long before send rate. Set
+`MAX_ACCOUNTS_PER_WORKER` from YOUR delay, not a fixed 150/200.
+
+Per-send overhead was trimmed for throughput: user "sent to X" DB logs are now
+batched into the round summary, and the live logger message is fire-and-forget +
+bounded (`LIVE_LOG_MAX_PENDING`), so a flood-limited logger bot can never stall
+forwarding. At very high scale set `LIVE_SEND_LOGS=0` (round summaries only).
+
+## ⚠️ Account-level flood risk (most important)
+
+Worker capacity is a *software* limit. The harder limit is Telegram's: an account
+blasting **100+ distinct groups every 5s** is very likely to be PeerFlood-limited
+or banned no matter how many workers/IPs you have. This is per-account behavior,
+not hardware. Safer patterns: larger `msg_delay`, fewer groups per round, or
+rotating which groups each round targets. Treat 5s/100-groups as the aggressive
+end and expect account churn there.

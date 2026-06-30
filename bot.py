@@ -1104,6 +1104,14 @@ WORKER_ID = int(os.getenv('WORKER_ID', '0'))
 BOT_ROLE = os.getenv('BOT_ROLE', 'all').strip().lower()   # all | bot | worker
 RECONCILE_INTERVAL = int(os.getenv('RECONCILE_INTERVAL', '15'))
 START_BATCH = int(os.getenv('START_BATCH', '25'))
+# Soft cap: max accounts a single worker will run (0 = unlimited). The manager
+# uses this to decide how many workers to spawn; the reconciler enforces it so a
+# worker never overloads its event loop / IP.
+MAX_ACCOUNTS_PER_WORKER = int(os.getenv('MAX_ACCOUNTS_PER_WORKER', '0'))
+# Live per-send logging: keep ON for small scale; the manager/you can disable it
+# (LIVE_SEND_LOGS=0) at high throughput so the logger bot isn't the bottleneck.
+LIVE_SEND_LOGS = os.getenv('LIVE_SEND_LOGS', '1').strip().lower() in ('1', 'true', 'yes', 'on')
+LIVE_LOG_MAX_PENDING = int(os.getenv('LIVE_LOG_MAX_PENDING', '200'))
 
 
 def _owns_account(account_id):
@@ -1440,10 +1448,29 @@ async def send_log(account_id, message, view_link=None, group_name=None, delay_s
 async def add_user_log(user_id, log_msg):
     timestamp = datetime.now().strftime("%H:%M:%S")
     log_entry = f"[{timestamp}] {log_msg}"
-    users_col.update_one(
+    # Offload to a worker thread so user-log writes never block the event loop.
+    await db_call(users_col.update_one,
         {'user_id': user_id},
         {'$push': {'recent_logs': {'$each': [log_entry], '$slice': -100}}}
     )
+
+
+# Bounded fire-and-forget live logging: never let a slow/flood-limited logger bot
+# stall forwarding. Beyond LIVE_LOG_MAX_PENDING in-flight logs we simply drop them.
+_pending_live_logs = 0
+
+async def _fire_live_log(account_id, view_link, group_name, send_gap):
+    global _pending_live_logs
+    if _pending_live_logs >= LIVE_LOG_MAX_PENDING:
+        return
+    _pending_live_logs += 1
+    try:
+        await send_log(account_id, None, view_link=view_link, group_name=group_name, delay_sec=send_gap)
+    except Exception:
+        pass
+    finally:
+        _pending_live_logs -= 1
+
 
 async def run_forwarding_loop(user_id, account_id):
     print(f"[FORWARDING] Starting loop for account {account_id}")
@@ -1887,13 +1914,14 @@ async def run_forwarding_loop(user_id, account_id):
                         if send_started is not None:
                             last_send_started_at = send_started
                         print(f"[FORWARDING] Sent to {group_name} ({i+1}/{len(groups_to_forward)})")
-                        await add_user_log(user_id, f"Sent to {group_name}")
-                        
-                        # Send logs (now free for everyone)
-                        if sent_msg_id and current_entity:
+                        # Per-send user logs are batched into the round summary (end
+                        # of loop) instead of a DB write on every message.
+                        # Live "sent to X" log is fire-and-forget + bounded so a slow
+                        # or flood-limited logger bot never throttles forwarding.
+                        if LIVE_SEND_LOGS and sent_msg_id and current_entity:
                             view_link = build_message_link(current_entity, sent_msg_id, current_topic_id)
                             if view_link:
-                                await send_log(account_id, None, view_link=view_link, group_name=group_name, delay_sec=send_gap)
+                                asyncio.create_task(_fire_live_log(account_id, view_link, group_name, send_gap))
                         
                         # Stats are flushed once per round (see end of loop) to avoid
                         # a blocking DB write on every single message.
@@ -2145,7 +2173,19 @@ async def _reconcile_once():
         if _owns_account(acc_id) and acc.get('owner_id') is not None:
             desired_owned[acc_id] = acc['owner_id']
 
-    # Stop anything running locally that should no longer run.
+    # Enforce the soft per-worker cap. If this worker's shard is assigned more
+    # accounts than it can safely run, deterministically run only the first
+    # MAX_ACCOUNTS_PER_WORKER (sorted by id) and warn so the manager scales up.
+    if MAX_ACCOUNTS_PER_WORKER and len(desired_owned) > MAX_ACCOUNTS_PER_WORKER:
+        over = len(desired_owned) - MAX_ACCOUNTS_PER_WORKER
+        keep = sorted(desired_owned.keys(), key=lambda x: str(x))[:MAX_ACCOUNTS_PER_WORKER]
+        keep_set = set(keep)
+        desired_owned = {k: v for k, v in desired_owned.items() if k in keep_set}
+        print(f"[RECONCILE] OVER CAPACITY: worker {WORKER_ID} assigned "
+              f"{len(keep) + over} accounts but cap is {MAX_ACCOUNTS_PER_WORKER}; "
+              f"{over} not started. Add more workers/proxies.")
+
+    # Stop anything running locally that should no longer run (or got capped out).
     for acc_id in list(forwarding_tasks.keys()):
         if acc_id not in desired_owned:
             ensure_account_stopped(acc_id)
