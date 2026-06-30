@@ -230,3 +230,11 @@ Instead, users can set a **target frequency** — "message each group N times/ho
 Recommended **2–3/hour per group** — far safer for the accounts than the ~6–7/hr
 that 5s/100-groups produces by default. Stored as `target_per_hour` on the user;
 `0`/unset falls back to the interval preset's fixed cycle delay.
+
+### Now: frequency is a GLOBAL admin-only policy
+Frequency is no longer user-settable. It's a single global value
+(`bot_settings.target_per_hour`), **default 3/hour, hard-capped at 3**
+(`HARD_MAX_TARGET_PER_HOUR`). It always applies to every account.
+- Only admins change it: `/freq <1-3>` or Interval Settings → 🎯 (admin only).
+- Regular users just see "Frequency: ~3/hour per group (managed by admin)".
+- Recommended rollout: set `/freq 2` to test, then `/freq 3`.

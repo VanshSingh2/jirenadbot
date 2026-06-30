@@ -160,6 +160,45 @@ account_failed_groups_col = db['account_failed_groups']
 account_flood_waits_col = db['account_flood_waits']
 logger_tokens_col = db['logger_tokens']
 admins_col = db['admins']
+settings_col = db['bot_settings']
+
+# ---- Global, admin-controlled settings (e.g. the per-group send frequency) ----
+# Frequency is a GLOBAL policy: default 3 sends/hour per group, hard-capped at 3.
+# Users cannot change it; only admins can (for testing/rollout).
+HARD_MAX_TARGET_PER_HOUR = int(os.getenv('HARD_MAX_TARGET_PER_HOUR', '3'))
+DEFAULT_TARGET_PER_HOUR = int(os.getenv('DEFAULT_TARGET_PER_HOUR', '3'))
+_global_settings_cache = {}  # key -> (expires_monotonic, value)
+
+
+def get_global_setting(key, default):
+    import time as _t
+    now = _t.monotonic()
+    hit = _global_settings_cache.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    val = default
+    try:
+        doc = settings_col.find_one({'_id': 'global'})
+        if doc and key in doc:
+            val = doc[key]
+    except Exception:
+        pass
+    _global_settings_cache[key] = (now + 30, val)
+    return val
+
+
+def set_global_setting(key, value):
+    settings_col.update_one({'_id': 'global'}, {'$set': {key: value}}, upsert=True)
+    _global_settings_cache.pop(key, None)
+
+
+def get_effective_target_per_hour():
+    """Global per-group send frequency, clamped to [1, HARD_MAX_TARGET_PER_HOUR]."""
+    try:
+        v = int(get_global_setting('target_per_hour', DEFAULT_TARGET_PER_HOUR))
+    except Exception:
+        v = DEFAULT_TARGET_PER_HOUR
+    return max(1, min(HARD_MAX_TARGET_PER_HOUR, v))
 
 def ensure_indexes():
     """Create MongoDB indexes (idempotent)."""
@@ -1741,25 +1780,20 @@ async def run_forwarding_loop(user_id, account_id):
                     continue
                 
                 # ---- Target-frequency pacing -------------------------------
-                # If the user set a target (sends/hour per group), auto-compute the
-                # cycle delay so each group is messaged ~that often regardless of how
-                # many groups this account has.
+                # Frequency is a GLOBAL admin-managed policy (default 3/hr, max 3).
+                # Auto-compute the cycle delay so each group is messaged ~that often,
+                # regardless of how many groups this account has.
                 n_groups = len(groups_to_forward)
                 est_round_send = n_groups * msg_delay  # seconds (approx; msg_delay dominates)
-                target_per_hour = user.get('target_per_hour') or 0
-                freq_note = ""
-                if target_per_hour and target_per_hour > 0:
-                    target_cycle = 3600.0 / target_per_hour
-                    round_delay = max(TARGET_MIN_CYCLE_FLOOR, int(target_cycle - est_round_send))
-                    achievable = 3600.0 / max(1.0, est_round_send + round_delay)
-                    if est_round_send + TARGET_MIN_CYCLE_FLOOR >= target_cycle:
-                        freq_note = (f" | WARN {n_groups} groups x {msg_delay}s = {est_round_send//60}m/round; "
-                                     f"max ~{achievable:.1f}/hr (below target {target_per_hour}/hr)")
-                    else:
-                        freq_note = f" | ~{achievable:.1f}/hr per group (target {target_per_hour}/hr)"
+                target_per_hour = get_effective_target_per_hour()
+                target_cycle = 3600.0 / target_per_hour
+                round_delay = max(TARGET_MIN_CYCLE_FLOOR, int(target_cycle - est_round_send))
+                achievable = 3600.0 / max(1.0, est_round_send + round_delay)
+                if est_round_send + TARGET_MIN_CYCLE_FLOOR >= target_cycle:
+                    freq_note = (f" | WARN {n_groups} groups x {msg_delay}s = {est_round_send//60}m/round; "
+                                 f"max ~{achievable:.1f}/hr (target {target_per_hour}/hr)")
                 else:
-                    est_cycle = est_round_send + round_delay
-                    freq_note = f" | cycle ~{est_cycle//60}m (~{3600.0/max(1, est_cycle):.1f}/hr per group)"
+                    freq_note = f" | ~{achievable:.1f}/hr per group (target {target_per_hour}/hr)"
                 print(f"[FORWARDING] {account_id}: {n_groups} groups, msg_delay={msg_delay}s, "
                       f"round_delay={round_delay}s{freq_note}")
 
@@ -2952,14 +2986,16 @@ def interval_menu_keyboard(user_id):
         # Free plan: show button but mark as locked
         custom = Button.inline("Custom Timing 🔒", b"interval_locked")
 
-    freq_mark = " ✅" if user.get('target_per_hour') else ""
-    freq = Button.inline(f"🎯 Times/Hour per Group{freq_mark}", b"interval_freq")
-    return [
+    # Frequency is admin-managed (global). Only show the control to admins.
+    rows = [
         [slow, medium],
         [fast, custom],
-        [freq],
-        [Button.inline("Back", b"menu_broadcast")],
     ]
+    if is_admin(user_id):
+        eff = get_effective_target_per_hour()
+        rows.append([Button.inline(f"🎯 Frequency (admin): {eff}/hr", b"interval_freq")])
+    rows.append([Button.inline("Back", b"menu_broadcast")])
+    return rows
 
 def autoreply_menu_keyboard(user_id):
     if is_premium(user_id):
@@ -3657,22 +3693,22 @@ async def cmd_health(event):
 
 @main_bot.on(events.NewMessage(pattern=r'^/freq(?:@[\w_]+)?\s+(\d+)$'))
 async def cmd_freq(event):
-    """Set how many times per hour each group should be messaged (per account).
-    0 = off (use the interval preset's cycle delay)."""
+    """ADMIN ONLY. Set the GLOBAL per-group send frequency (times/hour) for all
+    users. Hard-capped at HARD_MAX_TARGET_PER_HOUR (default 3)."""
     uid = event.sender_id
-    val = int(event.pattern_match.group(1))
-    if val < 0 or val > 12:
-        await event.respond("Usage: /freq <0-12>  (times per hour per group; 0 = off; 2-3 recommended)")
+    if not is_admin(uid):
+        await event.respond("Frequency is managed by admin.")
         return
-    users_col.update_one({'user_id': uid}, {'$set': {'target_per_hour': val}}, upsert=True)
-    invalidate_user_cache(uid)
-    if val == 0:
-        await event.respond("🎯 Target frequency OFF (using your interval preset's cycle delay).")
-    else:
-        await event.respond(
-            f"🎯 Target set: ~{val}/hour per group.\n\n"
-            "The bot auto-adjusts each account's cycle delay from its group count."
-        )
+    val = int(event.pattern_match.group(1))
+    if val < 1 or val > HARD_MAX_TARGET_PER_HOUR:
+        await event.respond(f"Usage: /freq <1-{HARD_MAX_TARGET_PER_HOUR}>  (global times/hour per group)")
+        return
+    set_global_setting('target_per_hour', val)
+    await event.respond(
+        f"🎯 GLOBAL frequency set: ~{val}/hour per group (all users).\n\n"
+        "Auto-adjusts each account's cycle delay by its group count. "
+        "Takes effect within ~30s + the current round."
+    )
 
 
 # /add command removed per user request (use dashboard Add Account button)
@@ -5022,9 +5058,8 @@ async def callback(event):
                     "<b>━━━━━━━━━━━━━━━━━━━━━━━━━</b>"
                 )
             
-            tph = user.get('target_per_hour') or 0
-            if tph:
-                text += f"\n\n🎯 <b>Target:</b> <code>~{tph}/hour per group</code> (auto cycle delay)"
+            tph = get_effective_target_per_hour()
+            text += f"\n\n🎯 <b>Frequency:</b> <code>~{tph}/hour per group</code> (managed by admin)"
             await event.edit(text, parse_mode='html', buttons=interval_menu_keyboard(uid))
             return
         
@@ -5074,9 +5109,12 @@ async def callback(event):
             return
 
         if data == "interval_freq":
+            if not is_admin(uid):
+                await event.answer("Frequency is managed by admin.", alert=True)
+                return
             user_states[uid] = {'action': 'set_target_freq'}
             await event.edit(
-                "🎯 Target Frequency\n\nHow many times per hour should EACH group get a message (per account)?\n\nRecommended: 2-3 (safe). Enter 1-12, or 0 to turn off:",
+                f"🎯 Global Frequency (admin)\n\nHow many times per hour should EACH group get a message?\n\nCurrent: {get_effective_target_per_hour()}/hr. Max {HARD_MAX_TARGET_PER_HOUR}. Enter 1-{HARD_MAX_TARGET_PER_HOUR}:",
                 buttons=[[Button.inline("← Back", b"menu_interval")]]
             )
             return
@@ -8318,23 +8356,23 @@ async def text_handler(event):
             return
 
     if action == 'set_target_freq':
+        if not is_admin(uid):
+            user_states.pop(uid, None)
+            await event.respond("Frequency is managed by admin.")
+            return
         try:
             val = int(text)
         except Exception:
-            await event.respond("Please enter a number (0-12).")
+            await event.respond(f"Please enter a number (1-{HARD_MAX_TARGET_PER_HOUR}).")
             return
-        if val < 0 or val > 12:
-            await event.respond("Enter a number between 0 and 12 (0 = off).")
+        if val < 1 or val > HARD_MAX_TARGET_PER_HOUR:
+            await event.respond(f"Enter a number between 1 and {HARD_MAX_TARGET_PER_HOUR}.")
             return
-        users_col.update_one({'user_id': uid}, {'$set': {'target_per_hour': val}}, upsert=True)
-        invalidate_user_cache(uid)
+        set_global_setting('target_per_hour', val)
         user_states.pop(uid, None)
-        if val == 0:
-            msg = "🎯 Target frequency OFF. Using your interval preset's cycle delay."
-        else:
-            msg = (f"🎯 Target set: ~{val}/hour per group.\n\n"
-                   f"The bot auto-adjusts each account's cycle delay from its group count. "
-                   f"If an account has too many groups to reach {val}/hr, it runs as fast as it safely can.")
+        msg = (f"🎯 Global frequency set: ~{val}/hour per group (applies to ALL users).\n\n"
+               f"The bot auto-adjusts each account's cycle delay from its group count. "
+               f"Takes effect within ~30s + the current round.")
         await event.respond(msg, buttons=[[Button.inline("Back to Dashboard", b"enter_dashboard")]])
         return
 
