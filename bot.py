@@ -3356,7 +3356,7 @@ async def cmd_start(event):
     # If user activated any plan (free or premium), always show dashboard
     if approved:
         # User has plan activated, show dashboard with welcome image
-        dashboard_text = render_dashboard_text(uid)
+        dashboard_text = await db_call(render_dashboard_text, uid)
         dashboard_buttons = main_dashboard_keyboard(uid)
         welcome_image = MESSAGES.get('welcome_image', '')
         
@@ -4312,31 +4312,31 @@ async def callback(event):
                 root_path = os.path.abspath(os.sep)
                 disk = psutil.disk_usage(root_path)
 
-                total_users = users_col.count_documents({})
-                premium_users = users_col.count_documents({'tier': 'premium'})
-                today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-                new_today = users_col.count_documents({'created_at': {'$gte': today_start}}) if users_col.find_one({}, {'created_at': 1}) else 0
-                banned_users = 0  # Placeholder for banned users feature
-                
-                # Premium by plan (counts)
-                grow_count = users_col.count_documents({'tier': 'premium', 'plan': {'$regex': '^grow$', '$options': 'i'}})
-                prime_count = users_col.count_documents({'tier': 'premium', 'plan': {'$regex': '^prime$', '$options': 'i'}})
-                dominion_count = users_col.count_documents({'tier': 'premium', 'plan': {'$regex': '^dominion$', '$options': 'i'}})
-                
-                # Accounts
-                total_accounts = accounts_col.count_documents({})
-                active_broadcasts = accounts_col.count_documents({'is_forwarding': True})
-                
-                # Messaging stats
-                total_ads_sent = sum(stat.get('total_sent', 0) for stat in account_stats_col.find({}, {'total_sent': 1}))
-                # Auto replies counter (stored in db, incremented when auto-reply is sent)
-                auto_replies = sum(stat.get('auto_replies', 0) for stat in account_stats_col.find({}, {'auto_replies': 1}))
-                target_groups = account_topics_col.count_documents({}) + account_auto_groups_col.count_documents({})
-                
-                # Topics
-                total_topics = account_topics_col.count_documents({})
-                active_topics = len(set(t['topic'] for t in account_topics_col.find({}, {'topic': 1})))
-                failed_topics = account_failed_groups_col.count_documents({})
+                def _gather_stats():
+                    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                    return {
+                        'total_users': users_col.estimated_document_count(),
+                        'premium_users': users_col.count_documents({'tier': 'premium'}),
+                        'new_today': users_col.count_documents({'created_at': {'$gte': today_start}}),
+                        'grow_count': users_col.count_documents({'tier': 'premium', 'plan': {'$regex': '^grow$', '$options': 'i'}}),
+                        'prime_count': users_col.count_documents({'tier': 'premium', 'plan': {'$regex': '^prime$', '$options': 'i'}}),
+                        'dominion_count': users_col.count_documents({'tier': 'premium', 'plan': {'$regex': '^dominion$', '$options': 'i'}}),
+                        'total_accounts': accounts_col.estimated_document_count(),
+                        'active_broadcasts': accounts_col.count_documents({'is_forwarding': True}),
+                        'total_ads_sent': sum(s.get('total_sent', 0) for s in account_stats_col.find({}, {'total_sent': 1})),
+                        'auto_replies': sum(s.get('auto_replies', 0) for s in account_stats_col.find({}, {'auto_replies': 1})),
+                        'target_groups': account_topics_col.estimated_document_count() + account_auto_groups_col.estimated_document_count(),
+                        'total_topics': account_topics_col.estimated_document_count(),
+                        'active_topics': len(set(t['topic'] for t in account_topics_col.find({}, {'topic': 1}))),
+                        'failed_topics': account_failed_groups_col.estimated_document_count(),
+                    }
+                _st = await db_call(_gather_stats)
+                total_users = _st['total_users']; premium_users = _st['premium_users']; new_today = _st['new_today']
+                banned_users = 0
+                grow_count = _st['grow_count']; prime_count = _st['prime_count']; dominion_count = _st['dominion_count']
+                total_accounts = _st['total_accounts']; active_broadcasts = _st['active_broadcasts']
+                total_ads_sent = _st['total_ads_sent']; auto_replies = _st['auto_replies']; target_groups = _st['target_groups']
+                total_topics = _st['total_topics']; active_topics = _st['active_topics']; failed_topics = _st['failed_topics']
                 
                 text = (
                     "<b>📊 Full Statistics</b>\n\n"
@@ -4396,11 +4396,15 @@ async def callback(event):
             
             if data == "back_admin":
                 # Recreate admin panel
-                total_users = users_col.count_documents({})
-                premium_users = users_col.count_documents({'tier': 'premium'})
-                total_accounts = accounts_col.count_documents({})
-                active_accounts = accounts_col.count_documents({'is_forwarding': True})
-                total_admins = admins_col.count_documents({}) + 1
+                _st2 = await db_call(lambda: {
+                    'tu': users_col.estimated_document_count(),
+                    'pu': users_col.count_documents({'tier': 'premium'}),
+                    'ta': accounts_col.estimated_document_count(),
+                    'aa': accounts_col.count_documents({'is_forwarding': True}),
+                    'ad': admins_col.estimated_document_count(),
+                })
+                total_users = _st2['tu']; premium_users = _st2['pu']; total_accounts = _st2['ta']
+                active_accounts = _st2['aa']; total_admins = _st2['ad'] + 1
                 
                 text = (
                     "<b>Admin Panel</b>\n\n"
@@ -4540,7 +4544,7 @@ async def callback(event):
             if not is_approved(uid):
                 approve_user(uid)
 
-            text = render_dashboard_text(uid)
+            text = await db_call(render_dashboard_text, uid)
             
             buttons = main_dashboard_keyboard(uid)
             # Admin button removed (already in main_dashboard_keyboard)
@@ -6057,7 +6061,7 @@ async def callback(event):
                     pass
             await event.answer(f"Refreshed! Found {total_groups} groups.", alert=True)
             
-            text = render_dashboard_text(uid)
+            text = await db_call(render_dashboard_text, uid)
             buttons = main_dashboard_keyboard(uid)
             # Admin button removed (already in main_dashboard_keyboard)
             await event.edit(text, parse_mode='html', buttons=buttons)
@@ -6078,7 +6082,7 @@ async def callback(event):
             started = await start_broadcast_for_user(uid)
             await event.answer(f"Started {started} accounts!", alert=True)
 
-            text = render_dashboard_text(uid)
+            text = await db_call(render_dashboard_text, uid)
             buttons = main_dashboard_keyboard(uid)
             # Admin button removed (already in main_dashboard_keyboard)
             await event.edit(text, parse_mode='html', buttons=buttons)
@@ -6089,7 +6093,7 @@ async def callback(event):
             stopped = await stop_broadcast_for_user(uid)
             await event.answer(f"Stopped {stopped} accounts!", alert=True)
 
-            text = render_dashboard_text(uid)
+            text = await db_call(render_dashboard_text, uid)
             buttons = main_dashboard_keyboard(uid)
             # Admin button removed (already in main_dashboard_keyboard)
             await event.edit(text, parse_mode='html', buttons=buttons)
