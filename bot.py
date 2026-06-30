@@ -1108,9 +1108,10 @@ START_BATCH = int(os.getenv('START_BATCH', '25'))
 # uses this to decide how many workers to spawn; the reconciler enforces it so a
 # worker never overloads its event loop / IP.
 MAX_ACCOUNTS_PER_WORKER = int(os.getenv('MAX_ACCOUNTS_PER_WORKER', '0'))
-# Live per-send logging: keep ON for small scale; the manager/you can disable it
-# (LIVE_SEND_LOGS=0) at high throughput so the logger bot isn't the bottleneck.
-LIVE_SEND_LOGS = os.getenv('LIVE_SEND_LOGS', '1').strip().lower() in ('1', 'true', 'yes', 'on')
+# Live per-send logging: OFF by default (round summaries already report results).
+# Turn ON (LIVE_SEND_LOGS=1) only at small scale; per-send logger calls do not
+# scale (a bot FloodWaits past ~30 msgs/sec).
+LIVE_SEND_LOGS = os.getenv('LIVE_SEND_LOGS', '0').strip().lower() in ('1', 'true', 'yes', 'on')
 LIVE_LOG_MAX_PENDING = int(os.getenv('LIVE_LOG_MAX_PENDING', '200'))
 
 
@@ -1446,13 +1447,10 @@ async def send_log(account_id, message, view_link=None, group_name=None, delay_s
         print(f"[LOG ERROR] {e}")
 
 async def add_user_log(user_id, log_msg):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    log_entry = f"[{timestamp}] {log_msg}"
-    # Offload to a worker thread so user-log writes never block the event loop.
-    await db_call(users_col.update_one,
-        {'user_id': user_id},
-        {'$push': {'recent_logs': {'$each': [log_entry], '$slice': -100}}}
-    )
+    # `recent_logs` is never read or shown anywhere, so we no longer persist a
+    # per-user activity log to MongoDB (it was pure write load on hot user docs).
+    # A cheap stdout line keeps the info in server logs at no DB/RAM cost.
+    print(f"[USERLOG {user_id}] {log_msg}")
 
 
 # Bounded fire-and-forget live logging: never let a slow/flood-limited logger bot
