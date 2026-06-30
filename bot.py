@@ -1027,6 +1027,39 @@ def update_account_stats(account_id, sent=0, failed=0):
         upsert=True
     )
 
+# ---- Batched, single-query helpers (replace N+1 per-account loops in renders) ----
+def any_account_has_autoreply(accounts):
+    ids = [str(acc['_id']) for acc in accounts]
+    if not ids:
+        return False
+    return account_settings_col.count_documents(
+        {'account_id': {'$in': ids}, 'auto_reply': {'$nin': [None, '']}}
+    ) > 0
+
+def bulk_topic_counts(accounts, topics):
+    """One aggregation -> {topic: count} across all the user's accounts."""
+    ids = [acc['_id'] for acc in accounts]
+    if not ids:
+        return {}
+    agg = account_topics_col.aggregate([
+        {'$match': {'account_id': {'$in': ids}, 'topic': {'$in': list(topics)}}},
+        {'$group': {'_id': '$topic', 'n': {'$sum': 1}}},
+    ])
+    return {d['_id']: d['n'] for d in agg}
+
+def bulk_auto_group_count(accounts):
+    ids = [str(acc['_id']) for acc in accounts]
+    if not ids:
+        return 0
+    return account_auto_groups_col.count_documents({'account_id': {'$in': ids}})
+
+def bulk_total_sent(accounts):
+    ids = [str(acc['_id']) for acc in accounts]
+    if not ids:
+        return 0
+    return sum(s.get('total_sent', 0) for s in
+               account_stats_col.find({'account_id': {'$in': ids}}, {'total_sent': 1}))
+
 def is_group_failed(account_id, group_key):
     failed = account_failed_groups_col.find_one({'account_id': account_id, 'group_key': group_key})
     return failed is not None
@@ -2978,11 +3011,10 @@ def admin_autoreply_menu(target_id: int, source: str):
     accounts = get_user_accounts(target_id)
     has_custom = False
     if accounts:
-        for acc in accounts:
-            settings_doc = account_settings_col.find_one({'account_id': str(acc['_id'])})
-            if settings_doc and settings_doc.get('auto_reply'):
-                has_custom = True
-                break
+        _ids = [str(acc['_id']) for acc in accounts]
+        has_custom = account_settings_col.count_documents(
+            {'account_id': {'$in': _ids}, 'auto_reply': {'$nin': [None, '']}}
+        ) > 0
 
     text = (
         "<b>Admin: Auto Reply</b>\n\n"
@@ -3141,11 +3173,10 @@ def autoreply_menu_keyboard(user_id):
         accounts = get_user_accounts(user_id)
         has_custom = False
         if accounts:
-            for acc in accounts:
-                settings_doc = account_settings_col.find_one({'account_id': str(acc['_id'])})
-                if settings_doc and 'auto_reply' in settings_doc and settings_doc.get('auto_reply'):
-                    has_custom = True
-                    break
+            _ids = [str(acc['_id']) for acc in accounts]
+            has_custom = account_settings_col.count_documents(
+                {'account_id': {'$in': _ids}, 'auto_reply': {'$nin': [None, '']}}
+            ) > 0
         
         # Single toggle button: show the opposite action only
         toggle_btn = Button.inline("Turn OFF" if enabled else "Turn ON", b"autoreply_toggle")
@@ -3585,11 +3616,15 @@ async def cmd_mystats(event):
         return
     
     user = get_user(uid)
-    accounts = get_user_accounts(uid)
+    accounts = await db_call(get_user_accounts, uid)
     tier = "Premium" if is_premium(uid) else "No Plan"
     
-    total_sent = sum(get_account_stats(str(acc['_id'])).get('total_sent', 0) for acc in accounts)
-    total_failed = sum(get_account_stats(str(acc['_id'])).get('total_failed', 0) for acc in accounts)
+    acc_ids = [str(acc['_id']) for acc in accounts]
+    stats_docs = await db_call(lambda: list(
+        account_stats_col.find({'account_id': {'$in': acc_ids}}, {'total_sent': 1, 'total_failed': 1})
+    )) if acc_ids else []
+    total_sent = sum(s.get('total_sent', 0) for s in stats_docs)
+    total_failed = sum(s.get('total_failed', 0) for s in stats_docs)
     active = sum(1 for acc in accounts if acc.get('is_forwarding'))
     
     text = (
@@ -4663,16 +4698,14 @@ async def callback(event):
             total_groups = 0
             total_auto_replies = 0
             
-            for acc in accounts:
-                # Convert ObjectId to string for stats lookup
-                account_id = str(acc['_id'])
-                stats = account_stats_col.find_one({'account_id': account_id})
-                if stats:
-                    total_sent += stats.get('total_sent', 0)
-                    total_failed += stats.get('total_failed', 0)
-                    total_auto_replies += stats.get('auto_replies', 0)
-                groups = account_auto_groups_col.count_documents({'account_id': account_id})
-                total_groups += groups
+            _ids = [str(acc['_id']) for acc in accounts]
+            if _ids:
+                _sd = await db_call(lambda: list(account_stats_col.find(
+                    {'account_id': {'$in': _ids}}, {'total_sent': 1, 'total_failed': 1, 'auto_replies': 1})))
+                total_sent = sum(s.get('total_sent', 0) for s in _sd)
+                total_failed = sum(s.get('total_failed', 0) for s in _sd)
+                total_auto_replies = sum(s.get('auto_replies', 0) for s in _sd)
+                total_groups = await db_call(lambda: account_auto_groups_col.count_documents({'account_id': {'$in': _ids}}))
             
             active = sum(1 for acc in accounts if acc.get('is_forwarding'))
             
@@ -5022,17 +5055,12 @@ async def callback(event):
                 # Admin/God Mode Display
                 accounts = get_user_accounts(uid)
                 active_accounts = sum(1 for acc in accounts if acc.get('is_forwarding'))
-                total_groups = 0
-                total_messages = 0
-                
-                for acc in accounts:
-                    account_id = str(acc['_id'])
-                    groups = account_auto_groups_col.count_documents({'account_id': account_id})
-                    total_groups += groups
-                    
-                    stats = account_stats_col.find_one({'account_id': account_id})
-                    if stats:
-                        total_messages += stats.get('total_sent', 0)
+                _ids = [str(acc['_id']) for acc in accounts]
+                total_groups = await db_call(lambda: account_auto_groups_col.count_documents(
+                    {'account_id': {'$in': _ids}})) if _ids else 0
+                _statd = await db_call(lambda: list(account_stats_col.find(
+                    {'account_id': {'$in': _ids}}, {'total_sent': 1}))) if _ids else []
+                total_messages = sum(s.get('total_sent', 0) for s in _statd)
                 
                 # Get current settings
                 interval_preset = user.get('interval_preset', 'medium')
@@ -5109,15 +5137,10 @@ async def callback(event):
                 total_groups = 0
                 total_messages = 0
                 
-                for acc in accounts:
-                    account_id = str(acc['_id'])
-                    groups = account_auto_groups_col.count_documents({'account_id': account_id})
-                    total_groups += groups
-                    
-                    # Get total messages sent
-                    stats = account_stats_col.find_one({'account_id': account_id})
-                    if stats:
-                        total_messages += stats.get('total_sent', 0)
+                _ids = [str(acc['_id']) for acc in accounts]
+                if _ids:
+                    total_groups = await db_call(lambda: account_auto_groups_col.count_documents({'account_id': {'$in': _ids}}))
+                    total_messages = await db_call(bulk_total_sent, accounts)
                 
                 # Get current settings
                 interval_preset = user.get('interval_preset', 'medium')
@@ -5275,10 +5298,17 @@ async def callback(event):
                 text += "\n\n<i>Upgrade to a paid plan for all topics.</i>"
             
             buttons = []
-            for i, topic in enumerate(TOPICS[:max_topics]):
-                count = 0
-                for acc in accounts:
-                    count += account_topics_col.count_documents({'account_id': acc['_id'], 'topic': topic})
+            _topic_list = list(TOPICS[:max_topics])
+            _acc_ids = [acc['_id'] for acc in accounts]
+            _topic_counts = {}
+            if _acc_ids:
+                _agg = await db_call(lambda: list(account_topics_col.aggregate([
+                    {'$match': {'account_id': {'$in': _acc_ids}, 'topic': {'$in': _topic_list}}},
+                    {'$group': {'_id': '$topic', 'n': {'$sum': 1}}},
+                ])))
+                _topic_counts = {d['_id']: d['n'] for d in _agg}
+            for i, topic in enumerate(_topic_list):
+                count = _topic_counts.get(topic, 0)
                 buttons.append([Button.inline(f"{topic.title()} ({count} groups)", f"topic_select_{topic}")])
             
             if not is_premium(uid) and len(TOPICS) > max_topics:
@@ -5312,10 +5342,16 @@ async def callback(event):
             else:
                 text = f"<b>{_h(topic.title())}</b>\n\n<i>Select account to add groups:</i>"
                 buttons = []
+                _aids = [acc['_id'] for acc in accounts]
+                _agg = await db_call(lambda: list(account_topics_col.aggregate([
+                    {'$match': {'account_id': {'$in': _aids}, 'topic': topic}},
+                    {'$group': {'_id': '$account_id', 'n': {'$sum': 1}}},
+                ]))) if _aids else []
+                _cba = {str(d['_id']): d['n'] for d in _agg}
                 for acc in accounts:
                     phone = acc['phone'][-4:]
                     name = acc.get('name', 'Unknown')[:12]
-                    count = account_topics_col.count_documents({'account_id': acc['_id'], 'topic': topic})
+                    count = _cba.get(str(acc['_id']), 0)
                     buttons.append([Button.inline(f"{phone} - {name} ({count})", f"topic_acc_{topic}_{acc['_id']}")])
                 buttons.append([Button.inline("Back", b"menu_topics")])
                 await event.edit(text, parse_mode='html', buttons=buttons)
@@ -5611,13 +5647,7 @@ async def callback(event):
                 
                 # Check if user has set a custom message
                 accounts = get_user_accounts(uid)
-                has_custom = False
-                if accounts:
-                    for acc in accounts:
-                        settings_doc = account_settings_col.find_one({'account_id': str(acc['_id'])})
-                        if settings_doc and 'auto_reply' in settings_doc and settings_doc.get('auto_reply'):
-                            has_custom = True
-                            break
+                has_custom = any_account_has_autoreply(accounts)
                 
                 text += f"<b>Status:</b> <code>{'ON' if enabled else 'OFF'}</code>\n"
                 text += f"<b>Custom Reply:</b> {'✅' if has_custom else '❌'} <code>{'Set' if has_custom else 'Not Set'}</code>"
@@ -5637,11 +5667,11 @@ async def callback(event):
             accounts = get_user_accounts(uid)
             reply = None
             if accounts:
-                for acc in accounts:
-                    settings_doc = account_settings_col.find_one({'account_id': str(acc['_id'])})
-                    if settings_doc and 'auto_reply' in settings_doc:
-                        reply = settings_doc.get('auto_reply')
-                        break
+                _ids = [str(acc['_id']) for acc in accounts]
+                _d = account_settings_col.find_one(
+                    {'account_id': {'$in': _ids}, 'auto_reply': {'$exists': True}}, {'auto_reply': 1})
+                if _d:
+                    reply = _d.get('auto_reply')
             
             if reply:
                 text = f"<b>💬 Current Auto Reply</b>\n\n<blockquote>{_h(reply)}</blockquote>"
@@ -5675,13 +5705,7 @@ async def callback(event):
             
             # Check if user has set a custom message
             accounts = get_user_accounts(uid)
-            has_custom = False
-            if accounts:
-                for acc in accounts:
-                    settings_doc = account_settings_col.find_one({'account_id': str(acc['_id'])})
-                    if settings_doc and 'auto_reply' in settings_doc and settings_doc.get('auto_reply'):
-                        has_custom = True
-                        break
+            has_custom = any_account_has_autoreply(accounts)
             
             text += f"<b>Status:</b> <code>{'ON' if enabled else 'OFF'}</code>\n"
             text += f"<b>Custom Reply:</b> {'✅' if has_custom else '❌'} <code>{'Set' if has_custom else 'Not Set'}</code>"
@@ -6775,11 +6799,11 @@ async def callback(event):
             accounts = get_user_accounts(target_id)
             reply = None
             if accounts:
-                for acc in accounts:
-                    settings_doc = account_settings_col.find_one({'account_id': str(acc['_id'])})
-                    if settings_doc and 'auto_reply' in settings_doc:
-                        reply = settings_doc.get('auto_reply')
-                        break
+                _ids = [str(acc['_id']) for acc in accounts]
+                _d = account_settings_col.find_one(
+                    {'account_id': {'$in': _ids}, 'auto_reply': {'$exists': True}}, {'auto_reply': 1})
+                if _d:
+                    reply = _d.get('auto_reply')
             preview = _h(reply) if reply else "<i>Not set</i>"
             await event.edit(
                 f"<b>Admin: Auto Reply</b>\n\n{preview}",
@@ -6848,10 +6872,10 @@ async def callback(event):
             if not is_premium(target_id):
                 text += "\n\n<i>Upgrade to a paid plan for all topics.</i>"
             buttons = []
-            for topic in TOPICS[:max_topics]:
-                count = 0
-                for acc in accounts:
-                    count += account_topics_col.count_documents({'account_id': acc['_id'], 'topic': topic})
+            _tlist = list(TOPICS[:max_topics])
+            _tcounts = await db_call(bulk_topic_counts, accounts, _tlist)
+            for topic in _tlist:
+                count = _tcounts.get(topic, 0)
                 buttons.append([Button.inline(f"{topic.title()} ({count} groups)", f"admin_topic_select_{target_id}_{topic}_{source}")])
             buttons.append([Button.inline("Back", f"admin_menu_content_{target_id}_{source}")])
             await event.edit(text, parse_mode='html', buttons=buttons)
@@ -6882,10 +6906,16 @@ async def callback(event):
             else:
                 text = f"<b>{_h(topic.title())}</b>\n\n<i>Select account to add groups:</i>"
                 buttons = []
+                _aids = [acc['_id'] for acc in accounts]
+                _agg = await db_call(lambda: list(account_topics_col.aggregate([
+                    {'$match': {'account_id': {'$in': _aids}, 'topic': topic}},
+                    {'$group': {'_id': '$account_id', 'n': {'$sum': 1}}},
+                ]))) if _aids else []
+                _cba = {str(d['_id']): d['n'] for d in _agg}
                 for acc in accounts:
                     phone = acc['phone'][-4:]
                     name = acc.get('name', 'Unknown')[:12]
-                    count = account_topics_col.count_documents({'account_id': acc['_id'], 'topic': topic})
+                    count = _cba.get(str(acc['_id']), 0)
                     buttons.append([Button.inline(f"{phone} - {name} ({count})", f"admin_topic_acc_{target_id}_{topic}_{acc['_id']}_{source}")])
                 buttons.append([Button.inline("Back", f"admin_menu_topics_{target_id}_{source}")])
                 await event.edit(text, parse_mode='html', buttons=buttons)
