@@ -118,3 +118,48 @@ These were added on top of the perf fixes to keep the bot up and self-healing:
 - **Shard accounts across worker processes** once you outgrow a single loop.
 - **Full `motor` async migration** for the remaining synchronous call sites
   outside the forwarding hot path (command handlers).
+
+
+## Deployment & horizontal scaling (implemented)
+
+The bot is now driven by a **desired-state reconciler**: pressing Start/Stop just
+flips `is_forwarding` in MongoDB; each process runs a reconciler that owns a
+**shard** of accounts and starts/stops supervisors to match. This makes scaling
+a matter of running more processes — no code changes.
+
+### Roles & workers (env vars)
+- `BOT_ROLE=all` (default) — one process does UI + forwarding. Use this now.
+- `BOT_ROLE=bot` — only the Telegram UI bot (no forwarding).
+- `BOT_ROLE=worker` — only forwards its shard (no UI bot).
+- `WORKER_COUNT` / `WORKER_ID` — accounts are split across `WORKER_COUNT`
+  forwarding processes by a stable hash; each worker sets a unique `WORKER_ID`
+  (0-based). Single process => `WORKER_COUNT=1, WORKER_ID=0` (owns everything).
+
+Example multi-process layout (later):
+- 1 × `BOT_ROLE=bot`
+- N × `BOT_ROLE=worker WORKER_COUNT=N WORKER_ID=0..N-1`
+
+### Proxies (sticky per account)
+Set `PROXY_LIST` (see `.env.example`). Each account is pinned to one proxy by a
+stable hash, so it always egresses from the same IP. Proxies apply to the
+persistent forwarding clients automatically via `make_account_client`.
+
+### When to add more IPs / proxies
+Rules of thumb (Telegram is stricter than these in practice — stay conservative):
+- **1 IP** is fine for your own handful of accounts (now).
+- Keep roughly **≤ 30–50 logged-in account sessions per IP**. Past that, Telegram
+  starts flagging the IP and you'll see more `PeerFlood`/auth issues.
+- So: **add a proxy/IP for roughly every ~30–50 accounts.** 200 accounts ⇒
+  ~4–6 IPs; 1000 accounts ⇒ ~20–30 IPs (residential/mobile proxies are safest).
+- Add a **second machine + split workers** once one box passes ~150–300 active
+  accounts (CPU/RAM and single-event-loop limits), or sooner if loop-lag grows.
+
+### Process manager (required for production)
+Run under systemd (`Restart=always`) or Docker (`restart: unless-stopped`).
+In-process supervision restarts crashed account loops; the process manager
+restarts the whole process on fatal crashes/OOM. Install `cryptg` (now in
+requirements) so MTProto AES runs in C — a major CPU saving at scale.
+
+### Ops
+- `/health` (admin) and the periodic `[HEALTH]` log show role, worker, active
+  accounts (local + DB), proxy count, uptime, RSS and CPU.

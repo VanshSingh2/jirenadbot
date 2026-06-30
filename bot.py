@@ -5,6 +5,7 @@ import psutil
 import random
 import string
 import re
+import hashlib
 from datetime import datetime, timedelta
 from telethon import TelegramClient, Button, events
 from telethon.sessions import StringSession
@@ -35,6 +36,13 @@ import time
 import requests
 import qrcode
 import random
+
+# Load environment variables from a local .env file if present (production secrets).
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 from config import BOT_CONFIG, FREE_TIER, PREMIUM_TIER, MESSAGES, TOPICS, INTERVAL_PRESETS, FORCE_JOIN, PLANS, PLAN_SCOUT, PLAN_IMAGES, UPI_PAYMENT, PROXIES as CONFIG_PROXIES
 
@@ -847,9 +855,9 @@ async def start_broadcast_for_user(target_id: int) -> int:
             has_groups = auto_count > 0
         print(f"[ADS DEBUG] has_groups={has_groups}")
         accounts_col.update_one({'_id': acc['_id']}, {'$set': {'is_forwarding': True}})
-        if acc['_id'] not in forwarding_tasks or forwarding_tasks[acc['_id']].done():
-            task = asyncio.create_task(supervise_forwarding(target_id, acc['_id']))
-            forwarding_tasks[acc['_id']] = task
+        # Start locally now if we own this account; else the owning worker's
+        # reconciler picks it up from the is_forwarding flag.
+        if ensure_account_running(target_id, acc['_id']):
             status_msg = " (⚠️ No groups configured!)" if not has_groups else ""
             print(f"[ADS] Started forwarding task for account {acc['_id']}{status_msg}")
         started += 1
@@ -1014,6 +1022,98 @@ def get_proxy_candidates():
     if not PROXIES:
         return [None]
     return [get_next_proxy() for _ in range(len(PROXIES))]
+
+# ===================== Scaling: proxies, sharding, client factory =====================
+# Runtime proxy pool = config PROXIES + anything from the PROXY_LIST env var.
+# Format per entry (line- or ';'-separated):  type:host:port[:user:pass]
+#   type in {socks5, socks4, http}. Proxies are assigned STICKILY per account so
+#   an account always egresses from the same IP (Telegram dislikes IP hopping).
+
+def _load_runtime_proxies():
+    proxies = list(PROXIES) if PROXIES else []
+    raw = os.getenv('PROXY_LIST', '').strip()
+    if raw:
+        for line in re.split(r'[\n;]+', raw):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(':')
+            if len(parts) < 3:
+                print(f"[PROXY] Ignoring malformed proxy entry: {line}")
+                continue
+            entry = {'type': parts[0].strip().lower(), 'host': parts[1].strip(), 'port': int(parts[2].strip())}
+            if len(parts) >= 5:
+                entry['username'] = parts[3].strip()
+                entry['password'] = parts[4].strip()
+            proxies.append(entry)
+    return proxies
+
+RUNTIME_PROXIES = _load_runtime_proxies()
+
+
+def _proxy_tuple(entry):
+    ptype = python_socks.ProxyType.SOCKS5
+    t = str(entry.get('type', 'socks5')).lower()
+    if t == 'socks4':
+        ptype = python_socks.ProxyType.SOCKS4
+    elif t == 'http':
+        ptype = python_socks.ProxyType.HTTP
+    return (ptype, entry['host'], int(entry['port']), True, entry.get('username'), entry.get('password'))
+
+
+def _stable_hash(value):
+    return int(hashlib.md5(str(value).encode()).hexdigest(), 16)
+
+
+def _proxy_for_account(account_id):
+    """Pick a sticky proxy for an account (same account -> same proxy)."""
+    if not RUNTIME_PROXIES:
+        return None
+    idx = _stable_hash(account_id) % len(RUNTIME_PROXIES)
+    try:
+        return _proxy_tuple(RUNTIME_PROXIES[idx])
+    except Exception as e:
+        print(f"[PROXY] Failed to build proxy for {account_id}: {e}")
+        return None
+
+
+# Shared resilience settings for every Telethon client we open.
+_CLIENT_RESILIENCE_KW = dict(
+    connection_retries=None,
+    retry_delay=5,
+    auto_reconnect=True,
+    request_retries=5,
+    flood_sleep_threshold=60,
+)
+
+
+def make_account_client(session, account_id=None):
+    """Create a resilient Telethon client for a user account, behind that
+    account's sticky proxy (if any). Use everywhere we open an account session."""
+    proxy = _proxy_for_account(account_id) if account_id is not None else None
+    return TelegramClient(
+        StringSession(session), CONFIG['api_id'], CONFIG['api_hash'],
+        proxy=proxy,
+        **_CLIENT_RESILIENCE_KW,
+    )
+
+
+# ---- Worker sharding (lets you run multiple forwarding processes later) ----
+WORKER_COUNT = max(1, int(os.getenv('WORKER_COUNT', '1')))
+WORKER_ID = int(os.getenv('WORKER_ID', '0'))
+BOT_ROLE = os.getenv('BOT_ROLE', 'all').strip().lower()   # all | bot | worker
+RECONCILE_INTERVAL = int(os.getenv('RECONCILE_INTERVAL', '15'))
+START_BATCH = int(os.getenv('START_BATCH', '25'))
+
+
+def _owns_account(account_id):
+    """Does THIS process own (forward) the given account?
+    - role 'bot' never forwards.
+    - otherwise, shard accounts across WORKER_COUNT by a stable hash."""
+    if BOT_ROLE == 'bot':
+        return False
+    return (_stable_hash(account_id) % WORKER_COUNT) == (WORKER_ID % WORKER_COUNT)
+
 
 def parse_link(link):
     topic_id = None
@@ -1356,14 +1456,7 @@ async def run_forwarding_loop(user_id, account_id):
             return
         
         session = cipher_suite.decrypt(acc['session'].encode()).decode()
-        client = TelegramClient(
-            StringSession(session), CONFIG['api_id'], CONFIG['api_hash'],
-            connection_retries=None,    # retry connecting forever (survive network blips)
-            retry_delay=5,              # wait between connection retries
-            auto_reconnect=True,        # transparently reconnect if the link drops
-            request_retries=5,          # retry individual API calls a few times
-            flood_sleep_threshold=60,   # auto-sleep small floods instead of raising
-        )
+        client = make_account_client(session, account_id)
         await client.connect()
         
         if not await client.is_user_authorized():
@@ -2007,6 +2100,105 @@ async def resume_active_forwarding():
         resumed += 1
         await asyncio.sleep(stagger)
     print(f"[RESUME] Started {resumed} forwarding supervisor(s)")
+
+
+# ===================== Desired-state reconciliation engine =====================
+# Forwarding is driven by the `is_forwarding` flag in MongoDB (the "desired
+# state"). Each process runs a reconciler that ensures the accounts IT owns
+# (by shard) and that should be forwarding have a running supervisor, and that
+# anything it shouldn't run is stopped. This is what makes the bot horizontally
+# scalable: spin up more worker processes (each with its own WORKER_ID) and they
+# automatically split the load with no extra coordination code.
+
+def ensure_account_running(owner_id, account_id):
+    """Start a supervisor for this account locally if we own it and it isn't
+    already running. Returns True if a task is running/was started here."""
+    if owner_id is None or not _owns_account(account_id):
+        return False
+    existing = forwarding_tasks.get(account_id)
+    if existing and not existing.done():
+        return True
+    forwarding_tasks[account_id] = asyncio.create_task(supervise_forwarding(owner_id, account_id))
+    return True
+
+
+def ensure_account_stopped(account_id):
+    """Cancel the local supervisor for this account if present."""
+    task = forwarding_tasks.get(account_id)
+    if task and not task.done():
+        task.cancel()
+    forwarding_tasks.pop(account_id, None)
+
+
+async def _reconcile_once():
+    """One pass: align locally-running supervisors with desired DB state."""
+    try:
+        desired = await db_call(lambda: list(
+            accounts_col.find({'is_forwarding': True}, {'_id': 1, 'owner_id': 1})
+        ))
+    except Exception as e:
+        print(f"[RECONCILE] Query failed: {e}")
+        return
+    desired_owned = {}
+    for acc in desired:
+        acc_id = acc['_id']
+        if _owns_account(acc_id) and acc.get('owner_id') is not None:
+            desired_owned[acc_id] = acc['owner_id']
+
+    # Stop anything running locally that should no longer run.
+    for acc_id in list(forwarding_tasks.keys()):
+        if acc_id not in desired_owned:
+            ensure_account_stopped(acc_id)
+
+    # Start missing ones, capped per cycle so a big fleet ramps up smoothly.
+    started = 0
+    for acc_id, owner_id in desired_owned.items():
+        existing = forwarding_tasks.get(acc_id)
+        if existing and not existing.done():
+            continue
+        ensure_account_running(owner_id, acc_id)
+        started += 1
+        if started >= START_BATCH:
+            break
+        await asyncio.sleep(0.2)
+    if started:
+        print(f"[RECONCILE] Started {started} account(s) this cycle "
+              f"(worker {WORKER_ID}/{WORKER_COUNT}, role={BOT_ROLE})")
+
+
+async def forwarding_reconciler():
+    """Background loop that keeps local forwarding aligned with desired state."""
+    print(f"[RECONCILE] Reconciler started (worker {WORKER_ID}/{WORKER_COUNT}, "
+          f"role={BOT_ROLE}, interval={RECONCILE_INTERVAL}s)")
+    while True:
+        try:
+            await _reconcile_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[RECONCILE] Error: {e}")
+        await asyncio.sleep(RECONCILE_INTERVAL)
+
+
+BOT_START_TIME = time.time()
+
+
+async def health_logger():
+    """Periodically print a one-line health summary for ops/monitoring."""
+    interval = int(os.getenv('HEALTH_INTERVAL', '300'))
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            active_local = sum(1 for t in forwarding_tasks.values() if not t.done())
+            print(
+                f"[HEALTH] role={BOT_ROLE} worker={WORKER_ID}/{WORKER_COUNT} "
+                f"local_active_accounts={active_local} proxies={len(RUNTIME_PROXIES)} "
+                f"uptime={_format_duration(int(time.time() - BOT_START_TIME))}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[HEALTH] {e}")
 
 
 async def forward_message(client, to_entity, msg_id, from_peer, topic_id=None):
@@ -3270,64 +3462,132 @@ async def cmd_bd_broadcast(event):
     sender_username = getattr(sender, 'username', None)
     sender_display = f"@{sender_username}" if sender_username else sender_name
     
-    # Progress message
-    progress_msg = await event.respond(f"📢 Broadcasting from {sender_display}...\n0/{total} (0%)")
-    
-    sent = 0
-    failed = 0
-    
+    asyncio.create_task(_run_forward_broadcast(event.chat_id, replied_msg, sender_display))
+    await event.respond(f"📢 Broadcasting from {sender_display} in the background. A summary will follow here.")
+
+async def _run_forward_broadcast(admin_chat_id, replied_msg, sender_display):
+    """Paced, FloodWait-safe forward-broadcast (preserves media/buttons/formatting).
+    Runs as a background task so the command handler is never blocked."""
+    users = await db_call(lambda: list(users_col.find({}, {'user_id': 1})))
+    total = len(users)
+    sent = failed = 0
+    delay = float(os.getenv('BROADCAST_DELAY', '0.1'))
+    status = None
+    try:
+        status = await main_bot.send_message(admin_chat_id, f"\U0001F4E2 Broadcasting from {sender_display}: 0/{total}")
+    except Exception:
+        pass
     for i, u in enumerate(users):
-        try:
-            # Forward the message directly (preserves media, buttons, formatting)
-            await main_bot.forward_messages(
-                u['user_id'],
-                replied_msg,
-                from_peer=event.chat_id
-            )
-            sent += 1
-        except Exception as e:
-            failed += 1
-            print(f"[BROADCAST] Failed to send to {u['user_id']}: {e}")
-        
-        # Update progress every 10 users or at end
-        if (i + 1) % 10 == 0 or (i + 1) == total:
-            percent = int(((i + 1) / total) * 100)
-            await progress_msg.edit(
-                f"📢 Broadcasting from {sender_display}...\n{i + 1}/{total} ({percent}%)\n\n"
-                f"✅ Sent: {sent}\n❌ Failed: {failed}"
-            )
-        
-        # Small delay to avoid flood
-        await asyncio.sleep(0.05)
-    
-    await progress_msg.edit(
-        f"✅ <b>Broadcast Complete!</b>\n\n"
-        f"<b>From:</b> {sender_display}\n"
-        f"<b>Total:</b> {total}\n"
-        f"<b>Sent:</b> {sent}\n"
-        f"<b>Failed:</b> {failed}",
-        parse_mode='html'
-    )
+        target = u.get('user_id')
+        if target is None:
+            continue
+        while True:
+            try:
+                await main_bot.forward_messages(target, replied_msg, from_peer=admin_chat_id)
+                sent += 1
+                break
+            except FloodWaitError as e:
+                await asyncio.sleep(min(int(getattr(e, 'seconds', 5)) + 1, 300))
+                continue
+            except Exception:
+                failed += 1
+                break
+        if status and ((i + 1) % 25 == 0 or (i + 1) == total):
+            try:
+                await status.edit(f"\U0001F4E2 Broadcasting from {sender_display}...\n{i + 1}/{total}\n\u2705 {sent}  \u274C {failed}")
+            except Exception:
+                pass
+        await asyncio.sleep(delay)
+    try:
+        await main_bot.send_message(admin_chat_id, f"\u2705 Forward-broadcast complete\nFrom: {sender_display}\nTotal: {total}\nSent: {sent}\nFailed: {failed}")
+    except Exception:
+        pass
+
+
+async def _run_text_broadcast(admin_chat_id, msg):
+    """Paced, FloodWait-safe broadcast of a text announcement to all users.
+    Runs as a background task so the command handler is never blocked."""
+    users = await db_call(lambda: list(users_col.find({}, {'user_id': 1})))
+    total = len(users)
+    sent = failed = 0
+    delay = float(os.getenv('BROADCAST_DELAY', '0.1'))
+    status = None
+    try:
+        status = await main_bot.send_message(admin_chat_id, f"📢 Broadcast started: 0/{total}")
+    except Exception:
+        pass
+    for i, u in enumerate(users):
+        target = u.get('user_id')
+        if target is None:
+            continue
+        while True:
+            try:
+                await main_bot.send_message(target, f"**Announcement**\n\n{msg}")
+                sent += 1
+                break
+            except FloodWaitError as e:
+                await asyncio.sleep(min(int(getattr(e, 'seconds', 5)) + 1, 300))
+                continue
+            except Exception:
+                failed += 1
+                break
+        if status and ((i + 1) % 25 == 0 or (i + 1) == total):
+            try:
+                await status.edit(f"📢 Broadcasting...\n{i + 1}/{total}\n✅ {sent}  ❌ {failed}")
+            except Exception:
+                pass
+        await asyncio.sleep(delay)
+    try:
+        await main_bot.send_message(admin_chat_id, f"✅ Broadcast complete\nTotal: {total}\nSent: {sent}\nFailed: {failed}")
+    except Exception:
+        pass
+
 
 @main_bot.on(events.NewMessage(pattern=r'^/broadcast(?:@[\w_]+)?\s+(.+)$', func=lambda e: not e.is_reply))
 async def cmd_broadcast(event):
     uid = event.sender_id
     if not is_admin(uid):
         return
-    
+
     msg = event.pattern_match.group(1)
-    users = get_all_users()
-    
-    sent = 0
-    failed = 0
-    for u in users:
-        try:
-            await main_bot.send_message(u['user_id'], f"**Announcement**\n\n{msg}")
-            sent += 1
-        except:
-            failed += 1
-    
-    await event.respond(f"Broadcast complete!\nSent: {sent}\nFailed: {failed}")
+    asyncio.create_task(_run_text_broadcast(event.chat_id, msg))
+    await event.respond("📢 Broadcast started in the background. I'll send a summary here when it finishes.")
+
+@main_bot.on(events.NewMessage(pattern=r'^/health(?:@[\w_]+)?(?:\s|$)'))
+async def cmd_health(event):
+    """Admin: quick health/metrics snapshot for this process."""
+    uid = event.sender_id
+    if not is_admin(uid):
+        return
+    local_active = sum(1 for t in forwarding_tasks.values() if not t.done())
+    try:
+        db_active = await db_call(lambda: accounts_col.count_documents({'is_forwarding': True}))
+        total_users = await db_call(lambda: users_col.count_documents({}))
+        total_accounts = await db_call(lambda: accounts_col.count_documents({}))
+    except Exception as e:
+        db_active = total_users = total_accounts = f"err: {e}"
+    try:
+        proc = psutil.Process()
+        mem_mb = proc.memory_info().rss / (1024 * 1024)
+        cpu = psutil.cpu_percent(interval=0.0)
+    except Exception:
+        mem_mb = cpu = -1
+    uptime = _format_duration(int(time.time() - BOT_START_TIME))
+    text = (
+        "<b>🩺 Health</b>\n\n"
+        f"<b>Role:</b> <code>{BOT_ROLE}</code>\n"
+        f"<b>Worker:</b> <code>{WORKER_ID}/{WORKER_COUNT}</code>\n"
+        f"<b>Proxies:</b> <code>{len(RUNTIME_PROXIES)}</code>\n"
+        f"<b>Uptime:</b> <code>{uptime}</code>\n\n"
+        f"<b>Active here:</b> <code>{local_active}</code>\n"
+        f"<b>Active (DB):</b> <code>{db_active}</code>\n"
+        f"<b>Accounts:</b> <code>{total_accounts}</code>\n"
+        f"<b>Users:</b> <code>{total_users}</code>\n\n"
+        f"<b>RSS:</b> <code>{mem_mb:.0f} MB</code>\n"
+        f"<b>CPU:</b> <code>{cpu:.0f}%</code>"
+    )
+    await event.respond(text, parse_mode='html')
+
 
 # /add command removed per user request (use dashboard Add Account button)
 
@@ -4323,13 +4583,9 @@ async def callback(event):
                 account_id = str(acc['_id'])
                 
                 # Stop forwarding task if running
-                if account_id in forwarding_tasks:
-                    try:
-                        forwarding_tasks[account_id].cancel()
-                        del forwarding_tasks[account_id]
-                        tasks_stopped += 1
-                    except Exception:
-                        pass
+                if forwarding_tasks.get(acc['_id']):
+                    tasks_stopped += 1
+                ensure_account_stopped(acc['_id'])
                 
                 # Stop auto reply if running
                 if account_id in auto_reply_clients:
@@ -6861,10 +7117,11 @@ async def callback(event):
             topic = parts[2] if len(parts) > 2 else "all"
             
             acc = get_account_by_id(account_id)
+            if not acc:
+                await event.answer("Account not found!", alert=True)
+                return
             accounts_col.update_one({'_id': acc['_id']}, {'$set': {'is_forwarding': True, 'fwd_topic': topic}})
-            
-            if account_id not in forwarding_tasks:
-                forwarding_tasks[account_id] = asyncio.create_task(forwarder_loop(account_id, topic, uid))
+            ensure_account_running(acc.get('owner_id', uid), acc['_id'])
             
             await event.answer("Started!")
             await event.edit(f"Forwarding started!\n\nTopic: {topic}", buttons=[[Button.inline("Back", f"acc_{account_id}")]])
@@ -6876,9 +7133,7 @@ async def callback(event):
             
             accounts_col.update_one({'_id': acc['_id']}, {'$set': {'is_forwarding': False}})
             
-            if account_id in forwarding_tasks:
-                forwarding_tasks[account_id].cancel()
-                del forwarding_tasks[account_id]
+            ensure_account_stopped(acc['_id'])
             
             if account_id in auto_reply_clients:
                 try:
@@ -6932,9 +7187,7 @@ async def callback(event):
                 account_failed_groups_col.delete_many({'account_id': {'$in': _account_id_variants(account_id)}})
                 logger_tokens_col.delete_many({'account_id': {'$in': _account_id_variants(account_id)}})
                 
-                if account_id in forwarding_tasks:
-                    forwarding_tasks[account_id].cancel()
-                    del forwarding_tasks[account_id]
+                ensure_account_stopped(acc['_id'])
                 
                 if account_id in auto_reply_clients:
                     try:
@@ -8458,546 +8711,6 @@ async def logger_handler(event):
     except Exception as e:
         await event.respond(f"Cannot send to that chat!\nMake sure I'm admin.\n\nError: {str(e)[:50]}")
 
-async def forwarder_loop(account_id, selected_topic, user_id):
-    print(f"[{account_id}] Starting forwarder (topic: {selected_topic})")
-    
-    acc = get_account_by_id(account_id)
-    if not acc:
-        return
-    
-    tier_settings = get_user_tier_settings(user_id)
-    
-    await send_log(account_id, f"<b>🚀 Forwarding started</b>\nAccount: <code>{_h(acc['phone'])}</code>\nTopic: <code>{_h(str(selected_topic))}</code>")
-    
-    while True:
-        try:
-            acc = get_account_by_id(account_id)
-            if not acc or not acc.get('is_forwarding'):
-                print(f"[{account_id}] Stopped")
-                break
-            
-            # Get user-level intervals (check for custom first, then tier defaults)
-            user_doc = get_user(user_id)
-            preset = user_doc.get('interval_preset', 'medium')
-            if preset == 'custom' and user_doc.get('custom_interval'):
-                custom = user_doc['custom_interval']
-                msg_delay = custom.get('msg_delay', 30)
-                round_delay = custom.get('round_delay', 600)
-            else:
-                interval_data = INTERVAL_PRESETS.get(preset, INTERVAL_PRESETS['medium'])
-                msg_delay = interval_data.get('msg_delay', tier_settings['msg_delay'])
-                round_delay = interval_data.get('round_delay', tier_settings['round_delay'])
-            
-            auto_reply_msg = settings.get('auto_reply', MESSAGES['auto_reply'])
-            reply_cooldown = settings.get('reply_cooldown', 300)
-            
-            try:
-                session = cipher_suite.decrypt(acc['session'].encode()).decode()
-                client = TelegramClient(StringSession(session), CONFIG['api_id'], CONFIG['api_hash'])
-                await client.connect()
-                
-                if not await client.is_user_authorized():
-                    print(f"[{account_id}] Session expired")
-                    await send_log(account_id, "Session expired!")
-                    await asyncio.sleep(60)
-                    continue
-                
-                await client.start()
-                
-                # ===================== Ads Source (Ads Mode) =====================
-                user_doc = get_user(user_id)
-                ads_mode = user_doc.get('ads_mode', 'saved')
-
-                ads = []
-                custom_text = None
-                post_source_entity = None
-                post_source_msg_id = None
-                post_source_input_peer = None
-
-                if ads_mode == 'custom':
-                    custom_text = (user_doc.get('ads_custom_message') or '').strip()
-                    if not custom_text:
-                        print(f"[{account_id}] Custom message not set")
-                        await send_log(account_id, "Custom message not set! Open Settings → Ads Mode → Set Custom Message.")
-                        await client.disconnect()
-                        await asyncio.sleep(60)
-                        continue
-
-                    # placeholder list so rotation logic works
-                    ads = [None]
-
-                elif ads_mode == 'post':
-                    link = (user_doc.get('ads_post_link') or '').strip()
-                    if not link:
-                        print(f"[{account_id}] Post link not set")
-                        await send_log(account_id, "Post link not set! Open Settings → Ads Mode → Set Post Link.")
-                        await client.disconnect()
-                        await asyncio.sleep(60)
-                        continue
-
-                    try:
-                        tail = link.replace('https://t.me/', '')
-                        parts = [p for p in tail.split('/') if p]
-                        if parts and parts[0] == 'c' and len(parts) >= 3:
-                            cid = parts[1]
-                            post_source_entity = int('-100' + str(cid))
-                            post_source_msg_id = int(parts[2])
-                        else:
-                            # username/123 OR username/topic/123
-                            post_source_entity = parts[0]
-                            post_source_msg_id = int(parts[-1])
-
-                        # verify message exists for this account
-                        _m = await client.get_messages(post_source_entity, ids=post_source_msg_id)
-                        if not _m:
-                            raise Exception('Message not found / no access')
-
-                        post_source_input_peer = await client.get_input_entity(post_source_entity)
-                        ads = [None]
-                    except Exception as e:
-                        print(f"[{account_id}] Invalid post link: {e}")
-                        await send_log(account_id, f"Invalid post link or no access: {str(e)[:120]}")
-                        await client.disconnect()
-                        await asyncio.sleep(60)
-                        continue
-
-                else:
-                    # saved (default)
-                    async for msg in client.iter_messages('me', limit=10):
-                        if msg.text or msg.media:
-                            ads.append(msg)
-                    ads.reverse()
-
-                    if not ads:
-                        print(f"[{account_id}] No ads in Saved Messages")
-                        await send_log(account_id, "No ads found in Saved Messages!")
-                        await client.disconnect()
-                        await asyncio.sleep(60)
-                        continue
-                
-                all_targets = []
-                max_topics = tier_settings.get('max_topics', 3)
-                
-                if selected_topic != "all" and selected_topic in TOPICS[:max_topics]:
-                    topic_links = list(account_topics_col.find({'account_id': {'$in': _account_id_variants(account_id)}, 'topic': selected_topic}))
-                    for t in topic_links:
-                        group_key = t['url']
-                        group_name = t.get('url', 'Unknown')
-                        if not is_group_failed(account_id, group_key):
-                            all_targets.append({'type': 'topic', 'data': t, 'key': group_key, 'name': group_name})
-                
-                auto_groups = account_auto_groups_col.find(
-                    {'account_id': {'$in': _account_id_variants(account_id)}}
-                ).sort('_id', 1)
-                topic_peers = set()
-                
-                if selected_topic != "all":
-                    for t in all_targets:
-                        if 'peer' in t['data']:
-                            topic_peers.add(str(t['data']['peer']))
-                
-                auto_limit = get_user_auto_group_limit(user_id)
-                count = 0
-                for g in auto_groups:
-                    group_key = str(g['group_id'])
-                    group_name = g.get('title', 'Unknown')
-                    if group_key not in topic_peers and not is_group_failed(account_id, group_key):
-                        all_targets.append({'type': 'auto', 'data': g, 'key': group_key, 'name': group_name})
-                        count += 1
-                        if auto_limit and count >= auto_limit:
-                            break
-                
-                active_waits = get_active_flood_waits(account_id)
-                
-                # Get user settings for log display
-                user_doc = get_user(user_id)
-                ads_mode_display = user_doc.get('ads_mode', 'saved').upper()
-                auto_leave = user_doc.get('auto_leave_groups', True)
-                auto_leave_status = "ON" if auto_leave else "OFF"
-                
-                print(f"[{account_id}] Forwarding to {len(all_targets)} groups (flood waits: {active_waits})")
-                await send_log(
-                    account_id, 
-                    f"<b>ꜱᴛᴀʀᴛɪɴɢ ʀᴏᴜɴᴅ</b>\n"
-                    f"<b>ᴍᴏᴅᴇ:</b> <code>ᴀᴜᴛᴏ</code>\n"
-                    f"<b>ᴀᴅꜱ ᴍᴏᴅᴇ:</b> <code>{ads_mode_display}</code>\n"
-                    f"<b>ᴀᴜᴛᴏ ʟᴇᴀᴠᴇ ꜰᴀɪʟᴇᴅ:</b> <code>{auto_leave_status}</code>\n\n"
-                    f"<b>Groups:</b> <code>{len(all_targets)}</code>\n"
-                    f"<b>Flood waits:</b> <code>{active_waits}</code>"
-                )
-                
-                # ===================== Smart Rotation (Premium) =====================
-                # Shuffle target order if enabled
-                user_settings = users_col.find_one({"user_id": user_id})
-                if user_settings and user_settings.get('smart_rotation', False):
-                    import random
-                    random.shuffle(all_targets)
-                    print(f"[{account_id}] Smart rotation: targets shuffled")
-                    await send_log(account_id, f"Smart rotation: {len(all_targets)} targets shuffled")
-                
-                sent = 0
-                failed = 0
-                skipped = 0
-                last_send_started_at = None
-                
-                for i, target in enumerate(all_targets):
-                    try:
-                        acc_check = get_account_by_id(account_id)
-                        if not acc_check or not acc_check.get('is_forwarding'):
-                            break
-
-                        wait_seconds, quiet_label = _get_quiet_hours_wait(user_id, user_doc)
-                        if wait_seconds > 0:
-                            try:
-                                wait_text = _format_duration(wait_seconds)
-                                quiet_label = quiet_label or "Quiet Hours"
-                                await send_log(
-                                    account_id,
-                                    "<b>Quiet Hours Active</b>\n\n"
-                                    f"<b>Window:</b> <code>{quiet_label}</code>\n"
-                                    f"<b>Pausing:</b> <code>{wait_text}</code>"
-                                )
-                            except Exception:
-                                pass
-                            ok = await _sleep_quiet_hours(wait_seconds, account_id)
-                            if not ok:
-                                break
-
-                        group_name = target.get('name', 'Unknown')[:30]
-                        group_key = target['key']
-                        
-                        wait_remaining = get_flood_wait(account_id, group_key)
-                        if wait_remaining > 0:
-                            skipped += 1
-                            mins = wait_remaining // 60
-                            print(f"[{account_id}] Skipped {group_name} (wait: {mins}m)")
-                            continue
-                        
-                        msg = ads[i % len(ads)] if ads_mode == 'saved' else None
-                        
-                        sent_msg_id = None
-                        current_topic_id = None
-                        current_entity = None
-                        send_gap = None
-                        send_started = None
-                        
-                        if target['type'] == 'topic':
-                            data = target['data']
-                            peer = data.get('peer')
-                            current_topic_id = data.get('topic_id')
-                            
-                            if peer is None:
-                                peer, _, current_topic_id = parse_link(data['url'])
-                            
-                            current_entity = await client.get_entity(peer)
-                            group_name = getattr(current_entity, 'title', group_name)[:30]
-                            
-                            if ads_mode == 'custom':
-                                # Send as text (optionally into a topic)
-                                send_started = time.monotonic()
-                                if last_send_started_at is not None:
-                                    send_gap = send_started - last_send_started_at
-                                if current_topic_id:
-                                    r = await client.send_message(current_entity, custom_text, reply_to=current_topic_id)
-                                else:
-                                    r = await client.send_message(current_entity, custom_text)
-                                sent_msg_id = getattr(r, 'id', None)
-
-                            elif ads_mode == 'post':
-                                # Forward a specific post link
-                                send_started = time.monotonic()
-                                if last_send_started_at is not None:
-                                    send_gap = send_started - last_send_started_at
-                                if current_topic_id:
-                                    sent_msg_id = await forward_message(client, current_entity, post_source_msg_id, post_source_input_peer, current_topic_id)
-                                else:
-                                    result = await client.forward_messages(current_entity, post_source_msg_id, post_source_entity)
-                                    if result:
-                                        if isinstance(result, list):
-                                            sent_msg_id = result[0].id if len(result) > 0 else None
-                                        else:
-                                            sent_msg_id = result.id
-
-                            else:
-                                # saved
-                                send_started = time.monotonic()
-                                if last_send_started_at is not None:
-                                    send_gap = send_started - last_send_started_at
-                                if current_topic_id:
-                                    sent_msg_id = await forward_message(client, current_entity, msg.id, msg.peer_id, current_topic_id)
-                                else:
-                                    result = await client.forward_messages(current_entity, msg.id, 'me')
-                                    if result:
-                                        if isinstance(result, list):
-                                            sent_msg_id = result[0].id if len(result) > 0 else None
-                                        else:
-                                            sent_msg_id = result.id
-                        else:
-                            data = target['data']
-                            group_id = data['group_id']
-                            access_hash = data.get('access_hash')
-                            is_channel = data.get('is_channel', True)
-                            username = data.get('username')
-                            
-                            current_entity = None
-                            if username:
-                                try:
-                                    current_entity = await client.get_entity(username)
-                                except:
-                                    pass
-                            
-                            if current_entity is None and access_hash:
-                                try:
-                                    if is_channel:
-                                        current_entity = InputPeerChannel(channel_id=group_id, access_hash=access_hash)
-                                    else:
-                                        current_entity = InputPeerChat(chat_id=group_id)
-                                except:
-                                    pass
-                            
-                            if current_entity is None:
-                                try:
-                                    current_entity = await client.get_entity(group_id)
-                                except:
-                                    current_entity = await client.get_entity(int('-100' + str(group_id)))
-
-                            if ads_mode == 'custom':
-                                send_started = time.monotonic()
-                                if last_send_started_at is not None:
-                                    send_gap = send_started - last_send_started_at
-                                r = await client.send_message(current_entity, custom_text)
-                                sent_msg_id = getattr(r, 'id', None)
-
-                            elif ads_mode == 'post':
-                                send_started = time.monotonic()
-                                if last_send_started_at is not None:
-                                    send_gap = send_started - last_send_started_at
-                                result = await client.forward_messages(current_entity, post_source_msg_id, post_source_entity)
-                                if result:
-                                    if isinstance(result, list):
-                                        sent_msg_id = result[0].id if len(result) > 0 else None
-                                    else:
-                                        sent_msg_id = result.id
-
-                            else:
-                                send_started = time.monotonic()
-                                if last_send_started_at is not None:
-                                    send_gap = send_started - last_send_started_at
-                                result = await client.forward_messages(current_entity, msg.id, 'me')
-                                if result:
-                                    if isinstance(result, list):
-                                        sent_msg_id = result[0].id if len(result) > 0 else None
-                                    else:
-                                        sent_msg_id = result.id
-                        
-                        sent += 1
-                        if send_started is not None:
-                            last_send_started_at = send_started
-                        print(f"[{account_id}] Sent to {group_name} ({i+1}/{len(all_targets)})")
-                        
-                        if sent_msg_id and current_entity:
-                            view_link = build_message_link(current_entity, sent_msg_id, current_topic_id)
-                            if view_link:
-                                await send_log(account_id, None, view_link=view_link, group_name=group_name, delay_sec=send_gap)
-                        
-                        await asyncio.sleep(msg_delay)
-                        
-                        # group_delay removed: msg_delay is used between each send
-                        
-                    except FloodWaitError as e:
-                        wait_secs = e.seconds
-                        mins = wait_secs // 60
-                        failed += 1
-                        
-                        set_flood_wait(account_id, group_key, group_name, wait_secs)
-                        
-                        print(f"[{account_id}] FloodWait {mins}m in {group_name}")
-                        await asyncio.sleep(msg_delay)
-                        
-                    except ChatWriteForbiddenError as e:
-                        # Sending/forwarding not allowed in this group - auto-leave if enabled
-                        failed += 1
-                        mark_group_failed(account_id, target['key'], str(e))
-                        error_type = type(e).__name__
-                        
-                        # Check if auto-leave is enabled
-                        user_check = get_user(user_id)
-                        auto_leave_enabled = user_check.get('auto_leave_groups', True)
-                        
-                        if not auto_leave_enabled:
-                            print(f"[{account_id}] Failed {group_name}: {error_type} - Auto-leave DISABLED, not leaving")
-                            continue
-                        
-                        print(f"[{account_id}] Failed {group_name}: {error_type} - Auto-leaving")
-
-                        try:
-                            leave_target = current_entity
-                            if leave_target is None:
-                                if target.get('type') == 'topic':
-                                    d = target.get('data') or {}
-                                    leave_target = d.get('peer')
-                                    if leave_target is None and d.get('url'):
-                                        leave_target, _, _ = parse_link(d.get('url'))
-                                else:
-                                    d = target.get('data') or {}
-                                    leave_target = d.get('username') or d.get('group_id')
-                            if leave_target is not None:
-                                left_ok = await safe_leave_chat(client, leave_target)
-                                if left_ok:
-                                    remove_group_from_db(account_id, target.get('type'), group_key, target.get('data'))
-                                    try:
-                                        phone = (acc.get('phone') if acc else None)
-                                    except Exception:
-                                        phone = None
-                                    await notify_auto_left(account_id, phone, group_name, group_key, reason=error_type)
-                                else:
-                                    await send_log(account_id, f"Leave attempt failed: {group_name}")
-                        except Exception as le:
-                            print(f"[{account_id}] Leave failed for {group_name}: {str(le)[:80]}")
-                        # No delay after auto-leave; continue immediately
-
-                    except UserBannedInChannelError as e:
-                        # User is banned from this group - auto-leave if enabled
-                        failed += 1
-                        mark_group_failed(account_id, target['key'], str(e))
-                        error_type = type(e).__name__
-                        
-                        # Check if auto-leave is enabled
-                        user_check = get_user(user_id)
-                        auto_leave_enabled = user_check.get('auto_leave_groups', True)
-                        
-                        if not auto_leave_enabled:
-                            print(f"[{account_id}] Failed {group_name}: {error_type} - Auto-leave DISABLED, not leaving")
-                            continue
-                        
-                        print(f"[{account_id}] Failed {group_name}: {error_type} - Auto-leaving")
-
-                        try:
-                            leave_target = current_entity
-                            if leave_target is None:
-                                if target.get('type') == 'topic':
-                                    d = target.get('data') or {}
-                                    leave_target = d.get('peer')
-                                    if leave_target is None and d.get('url'):
-                                        leave_target, _, _ = parse_link(d.get('url'))
-                                else:
-                                    d = target.get('data') or {}
-                                    leave_target = d.get('username') or d.get('group_id')
-                            if leave_target is not None:
-                                left_ok = await safe_leave_chat(client, leave_target)
-                                if left_ok:
-                                    remove_group_from_db(account_id, target.get('type'), group_key, target.get('data'))
-                                    try:
-                                        phone = (acc.get('phone') if acc else None)
-                                    except Exception:
-                                        phone = None
-                                    await notify_auto_left(account_id, phone, group_name, group_key, reason=error_type)
-                                else:
-                                    await send_log(account_id, f"Leave attempt failed: {group_name}")
-                        except Exception as le:
-                            print(f"[{account_id}] Leave failed for {group_name}: {str(le)[:80]}")
-                        # No delay after auto-leave; continue immediately
-
-                    except ChannelPrivateError as e:
-                        # Group is private/deleted - don't auto-leave, just mark as failed
-                        failed += 1
-                        mark_group_failed(account_id, target['key'], str(e))
-                        print(f"[{account_id}] Failed {group_name}: Group private/deleted - NOT auto-leaving")
-                        # No auto-leave for this error
-                        
-                    except Exception as e:
-                        error_str = str(e)
-                        
-                        wait_match = re.search(r'wait of (\d+) seconds', error_str, re.IGNORECASE)
-                        if wait_match:
-                            wait_secs = int(wait_match.group(1))
-                            failed += 1
-                            set_flood_wait(account_id, group_key, group_name, wait_secs)
-                        elif 'Could not find' in error_str or 'entity' in error_str.lower():
-                            failed += 1
-                            mark_group_failed(account_id, target['key'], error_str[:100])
-                        else:
-                            failed += 1
-                            print(f"[{account_id}] Error {group_name}: {error_str[:50]}")
-
-                        # Auto-leave on any send/forward failure (non-flood; only if enabled)
-                        if not _is_auto_leave_enabled(user_id):
-                            # Do not leave when disabled; just continue.
-                            continue
-                        try:
-                            leave_target = current_entity
-                            if leave_target is None:
-                                if target.get('type') == 'topic':
-                                    d = target.get('data') or {}
-                                    leave_target = d.get('peer')
-                                    if leave_target is None and d.get('url'):
-                                        leave_target, _, _ = parse_link(d.get('url'))
-                                else:
-                                    d = target.get('data') or {}
-                                    leave_target = d.get('username') or d.get('group_id')
-                            if leave_target is not None:
-                                left_ok = await safe_leave_chat(client, leave_target)
-                                if left_ok:
-                                    remove_group_from_db(account_id, target.get('type'), group_key, target.get('data'))
-                                    try:
-                                        phone = (acc.get('phone') if acc else None)
-                                    except Exception:
-                                        phone = None
-                                    await notify_auto_left(account_id, phone, group_name, group_key, reason=error_str[:120])
-                                else:
-                                    await send_log(account_id, f"Leave attempt failed: {group_name}")
-                        except Exception as le:
-                            print(f"[{account_id}] Leave failed for {group_name}: {str(le)[:80]}")
-                        
-                        # No delay after auto-leave; continue immediately to next group
-                
-                update_account_stats(account_id, sent=sent, failed=failed)
-                
-                log_msg = f"<b>✅ Round complete</b>\n📤 Sent: <code>{sent}</code> | ❌ Failed: <code>{failed}</code> | ⏭ Skipped: <code>{skipped}</code>\n\n⏰ Next: <code>{round_delay}s</code>"
-                await send_log(account_id, log_msg)
-                
-                print(f"[{account_id}] Round done! Sent: {sent}, Failed: {failed}")
-                
-                # Check if still forwarding before waiting
-                acc = get_account_by_id(account_id)
-                if not acc or not acc.get('is_forwarding', False):
-                    print(f"[{account_id}] Stopped before round delay")
-                    await client.disconnect()
-                    break
-                
-                print(f"[{account_id}] Waiting {round_delay}s...")
-                await _interruptible_round_sleep(round_delay, account_id, check_interval=15)
-                
-                await client.disconnect()
-                
-            except Exception as e:
-                print(f"[{account_id}] Loop error: {e}")
-                try:
-                    await send_log(account_id, f"<b>⚠ Loop error</b>\n<code>{_h(str(e)[:150])}</code>\n\nRetrying in 60s...")
-                except:
-                    pass
-                await asyncio.sleep(60)
-                
-        except Exception as e:
-            print(f"[{account_id}] Outer error: {e}")
-            try:
-                await send_log(account_id, f"<b>⚠ Error</b>\n<code>{_h(str(e)[:150])}</code>\n\nRetrying in 60s...")
-            except:
-                pass
-            await asyncio.sleep(60)
-    
-    if account_id in forwarding_tasks:
-        del forwarding_tasks[account_id]
-    if account_id in auto_reply_clients:
-        try:
-            await auto_reply_clients[account_id].disconnect()
-        except:
-            pass
-        del auto_reply_clients[account_id]
-    
-    await send_log(account_id, "Forwarding ended")
-    print(f"[{account_id}] Forwarder ended")
-
 # ===== NOTIFICATION SYSTEM =====
 async def send_notification(message_text, buttons=None):
     """Send notification to admin channel (auto-start notification bot if needed)."""
@@ -9412,67 +9125,81 @@ def _loop_exception_handler(loop, context):
 async def main():
     print("\n" + "="*50)
     print("Starting Jiren Ads Bot...")
+    print(f"Role={BOT_ROLE} | Worker {WORKER_ID}/{WORKER_COUNT} | Proxies={len(RUNTIME_PROXIES)}")
     print("="*50)
-    
+
     try:
         ensure_indexes()
         ensure_user_defaults()
-        await main_bot.start(bot_token=CONFIG['bot_token'])
-        me = await main_bot.get_me()
-        print(f"Main: @{me.username}")
-        try:
-            await main_bot(SetBotCommandsRequest(
-                scope=BotCommandScopeDefault(),
-                lang_code='',
-                commands=[
-                    BotCommand('start', 'Open main menu'),
-                    BotCommand('startbroadcast', 'Start broadcast'),
-                    BotCommand('stopbroadcast', 'Stop broadcast'),
-                ]
-            ))
-        except Exception as e:
-            print(f"[BOT COMMANDS] Failed to set commands: {e}")
     except Exception as e:
-        print(f"Main bot failed: {e}")
-        return
-    
-    try:
-        if CONFIG['logger_bot_token']:
-            await logger_bot.start(bot_token=CONFIG['logger_bot_token'])
-            me = await logger_bot.get_me()
-            print(f"Logger: @{me.username}")
-    except Exception as e:
-        print(f"Logger failed: {e}")
-    
-    try:
-        if CONFIG.get('notification_bot_token'):
-            await notification_bot.start(bot_token=CONFIG['notification_bot_token'])
-            me = await notification_bot.get_me()
-            print(f"Notification: @{me.username}")
-    except Exception as e:
-        print(f"Notification bot failed: {e}")
-    
-    print("="*50)
-    print("Bot running!")
-    print("="*50 + "\n")
+        print(f"[INIT] index/defaults setup issue: {e}")
 
-    # Log (don't crash on) any unhandled exception from background tasks.
+    # Background-task errors should be logged, not crash the loop.
     try:
         asyncio.get_running_loop().set_exception_handler(_loop_exception_handler)
     except Exception as e:
         print(f"[INIT] Could not set loop exception handler: {e}")
 
-    # Resume forwarding for accounts that were active before this (re)start.
-    try:
-        await resume_active_forwarding()
-    except Exception as e:
-        print(f"[RESUME] Failed: {e}")
+    serve_ui = BOT_ROLE in ('all', 'bot')          # runs the Telegram UI bot
+    do_forwarding = BOT_ROLE in ('all', 'worker')  # forwards its account shard
+    need_logger = serve_ui or do_forwarding        # logger bot used to send logs
 
-    await asyncio.gather(
-        main_bot.run_until_disconnected(),
-        logger_bot.run_until_disconnected() if CONFIG['logger_bot_token'] else asyncio.sleep(0),
-        notification_bot.run_until_disconnected() if CONFIG.get('notification_bot_token') else asyncio.sleep(0)
-    )
+    if serve_ui:
+        try:
+            await main_bot.start(bot_token=CONFIG['bot_token'])
+            me = await main_bot.get_me()
+            print(f"Main: @{me.username}")
+            try:
+                await main_bot(SetBotCommandsRequest(
+                    scope=BotCommandScopeDefault(),
+                    lang_code='',
+                    commands=[
+                        BotCommand('start', 'Open main menu'),
+                        BotCommand('startbroadcast', 'Start broadcast'),
+                        BotCommand('stopbroadcast', 'Stop broadcast'),
+                    ]
+                ))
+            except Exception as e:
+                print(f"[BOT COMMANDS] Failed to set commands: {e}")
+        except Exception as e:
+            print(f"Main bot failed: {e}")
+            return
+
+    if need_logger and CONFIG.get('logger_bot_token'):
+        try:
+            await logger_bot.start(bot_token=CONFIG['logger_bot_token'])
+            me = await logger_bot.get_me()
+            print(f"Logger: @{me.username}")
+        except Exception as e:
+            print(f"Logger failed: {e}")
+
+    if serve_ui and CONFIG.get('notification_bot_token'):
+        try:
+            await notification_bot.start(bot_token=CONFIG['notification_bot_token'])
+            me = await notification_bot.get_me()
+            print(f"Notification: @{me.username}")
+        except Exception as e:
+            print(f"Notification bot failed: {e}")
+
+    # Forwarding processes run the reconciler (resumes/aligns their shard) + health.
+    if do_forwarding:
+        asyncio.create_task(forwarding_reconciler())
+        asyncio.create_task(health_logger())
+
+    print("="*50)
+    print("Bot running!")
+    print("="*50 + "\n")
+
+    waiters = []
+    if serve_ui:
+        waiters.append(main_bot.run_until_disconnected())
+    if need_logger and CONFIG.get('logger_bot_token'):
+        waiters.append(logger_bot.run_until_disconnected())
+    if serve_ui and CONFIG.get('notification_bot_token'):
+        waiters.append(notification_bot.run_until_disconnected())
+    if not waiters:
+        waiters.append(asyncio.Event().wait())  # pure worker: stay alive
+    await asyncio.gather(*waiters)
 
 
 # ===== ADMIN: Grant Premium Commands =====

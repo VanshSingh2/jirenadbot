@@ -19,3 +19,8 @@ Scripts/
 **/session/
 *.session
 *.session-journal
+
+
+# Secrets / local env
+.env
+.env.local

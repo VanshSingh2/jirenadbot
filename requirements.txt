@@ -25,3 +25,7 @@ psutil>=5.9.0
 
 # Environment Variables (optional, for production)
 python-dotenv>=1.0.0
+
+
+# Performance: C-accelerated MTProto crypto (huge CPU win at scale)
+cryptg>=0.4.0
