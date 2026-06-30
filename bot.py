@@ -174,6 +174,7 @@ admins_col = db['admins']
 settings_col = db['bot_settings']
 worker_health_col = db['worker_health']
 click_links_col = db['click_links']
+discovered_groups_col = db['discovered_groups']
 
 # ---- Global, admin-controlled settings (e.g. the per-group send frequency) ----
 # Frequency is a GLOBAL policy: default 3 sends/hour per group, hard-capped at 3.
@@ -241,6 +242,10 @@ def ensure_indexes():
         admins_col.create_index('user_id', unique=True)
         click_links_col.create_index('code', unique=True)
         click_links_col.create_index('user_id')
+        # n8n group-discovery pipeline writes here; the finder reads by niche.
+        discovered_groups_col.create_index('username')
+        discovered_groups_col.create_index('niche')
+        discovered_groups_col.create_index([('niche', 1), ('username', 1)])
     except Exception as e:
         print(f"[DB] Index creation failed: {e}")
 
@@ -1124,6 +1129,7 @@ N8N_TRACK_BASE = os.getenv('N8N_TRACK_BASE', '').strip()  # e.g. https://your-n8
 FIND_CRAWL_SEEDS = int(os.getenv('FIND_CRAWL_SEEDS', '3'))     # how many seed groups to crawl
 FIND_CRAWL_MSGS = int(os.getenv('FIND_CRAWL_MSGS', '60'))      # recent messages to scan per seed
 FIND_CRAWL_RESOLVE = int(os.getenv('FIND_CRAWL_RESOLVE', '40'))  # max candidate links to resolve (flood-safety)
+FIND_DB_RESOLVE = int(os.getenv('FIND_DB_RESOLVE', '30'))  # max n8n-discovered usernames to resolve per search
 
 def create_tracked_link(user_id, target_url):
     code = generate_token(8)
@@ -1725,6 +1731,40 @@ async def find_niche_groups(uid, keyword, limit=50):
                     pass
                 resolved += 1
                 await asyncio.sleep(0.5)
+
+        # ---- Merge in groups discovered by the n8n web/directory scraper.
+        # The n8n "group-discovery" workflow writes public @usernames it finds
+        # across search engines + Telegram directory sites into the
+        # 'discovered_groups' collection. We resolve a capped number here (with
+        # the same megagroup filter) so those appear alongside in-app results.
+        try:
+            disc = await db_call(
+                lambda: list(discovered_groups_col.find(
+                    {'niche': {'$regex': re.escape(keyword), '$options': 'i'}},
+                    {'username': 1}
+                ).limit(FIND_DB_RESOLVE * 3))
+            )
+        except Exception:
+            disc = []
+        d_resolved = 0
+        for d in disc:
+            if d_resolved >= FIND_DB_RESOLVE:
+                break
+            un_raw = (d.get('username') or '').lstrip('@')
+            if not un_raw or un_raw.lower() in seen:
+                continue
+            try:
+                ent = await client.get_entity(un_raw)
+                un = getattr(ent, 'username', None)
+                if un and getattr(ent, 'megagroup', False) and un.lower() not in seen:
+                    seen.add(un.lower())
+                    found.append({'username': un, 'title': getattr(ent, 'title', un) or un})
+            except FloodWaitError:
+                break
+            except Exception:
+                pass
+            d_resolved += 1
+            await asyncio.sleep(0.5)
     except FloodWaitError as e:
         return None, f"flood_{getattr(e, 'seconds', 0)}"
     except Exception as e:

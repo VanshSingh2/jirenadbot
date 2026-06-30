@@ -1,0 +1,121 @@
+{
+  "name": "Jiren Ads - Telegram Group Discovery",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "discover",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "wh",
+      "name": "Webhook (POST /discover {niche,user_id})",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 320],
+      "webhookId": "jiren-group-discovery"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Build search URLs for the niche across several public sources.\n// Tip: for reliable Google results, add a SerpAPI/Bing-API node instead of\n// scraping (search engines block bots / Cloudflare). These are examples.\nconst body = $input.first().json.body || $input.first().json.query || {};\nconst niche = (body.niche || 'crypto').toString();\nconst user_id = Number(body.user_id || 0);\nconst q = encodeURIComponent(niche);\nconst qg = encodeURIComponent('\"' + niche + '\" telegram group t.me');\nconst urls = [\n  // Search engines (swap for an official search API where possible)\n  `https://www.bing.com/search?q=${qg}&count=40`,\n  `https://html.duckduckgo.com/html/?q=${qg}`,\n  // Telegram group directories (public listing sites)\n  `https://lyzem.com/search?q=${q}&type=groups`,\n  `https://tgstat.com/search?q=${q}`,\n  `https://cse.google.com/cse?cx=&q=${qg}`\n];\nreturn urls.map(u => ({ json: { url: u, niche, user_id } }));"
+      },
+      "id": "build",
+      "name": "Build search URLs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 320]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {
+          "response": { "response": { "responseFormat": "text" } },
+          "timeout": 20000,
+          "redirect": { "redirect": {} }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "User-Agent", "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36" },
+            { "name": "Accept-Language", "value": "en-US,en;q=0.9" }
+          ]
+        }
+      },
+      "id": "fetch",
+      "name": "Fetch pages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [720, 320],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Extract t.me/<username> links from every fetched page, dedupe, shape docs.\nconst bad = new Set(['joinchat','share','addstickers','addemoji','proxy','socks','iv','s','c','setlanguage','login','bg']);\nconst seen = new Set();\nconst out = [];\nconst re = /t\\.me\\/([A-Za-z0-9_]{4,32})/g;\nfor (const item of $input.all()) {\n  const body = String(item.json.data || item.json.body || item.json.body?.data || '');\n  const niche = item.json.niche || '';\n  const user_id = Number(item.json.user_id || 0);\n  let m;\n  while ((m = re.exec(body)) !== null) {\n    const u = m[1];\n    const ul = u.toLowerCase();\n    if (bad.has(ul) || ul.endsWith('bot') || seen.has(ul)) continue;\n    seen.add(ul);\n    out.push({ json: { username: u, niche, user_id, source: 'web', discovered_at: new Date().toISOString() } });\n  }\n}\nreturn out;"
+      },
+      "id": "extract",
+      "name": "Extract + dedupe t.me usernames",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 320]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "collection": "discovered_groups",
+        "fields": "username,niche,user_id,source,discovered_at",
+        "options": {}
+      },
+      "id": "mongo",
+      "name": "Mongo: save discovered_groups",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1,
+      "position": [1200, 320],
+      "credentials": { "mongoDb": { "id": "REPLACE_MONGO_CRED_ID", "name": "Jiren Mongo" } },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, discovered: $items('Extract + dedupe t.me usernames').length }) }}"
+      },
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1440, 320]
+    }
+  ],
+  "connections": {
+    "Webhook (POST /discover {niche,user_id})": { "main": [[{ "node": "Build search URLs", "type": "main", "index": 0 }]] },
+    "Build search URLs": { "main": [[{ "node": "Fetch pages", "type": "main", "index": 0 }]] },
+    "Fetch pages": { "main": [[{ "node": "Extract + dedupe t.me usernames", "type": "main", "index": 0 }]] },
+    "Extract + dedupe t.me usernames": { "main": [[{ "node": "Mongo: save discovered_groups", "type": "main", "index": 0 }]] },
+    "Mongo: save discovered_groups": { "main": [[{ "node": "Respond", "type": "main", "index": 0 }]] }
+  },
+  "settings": {},
+  "_README": [
+    "WHAT THIS DOES: discovers Telegram GROUP links for a niche from the open web",
+    "(search engines + Telegram directory sites), and saves them to MongoDB collection",
+    "'discovered_groups'. The bot's '\ud83d\udd0e Find Groups' merges these in, so users can Join All.",
+    "",
+    "FLOW: POST /webhook/discover {niche, user_id} -> build search URLs -> fetch pages",
+    "-> regex-extract t.me/<username> -> dedupe -> insert into discovered_groups -> respond.",
+    "",
+    "SETUP:",
+    "1) Import into n8n; set a MongoDB credential (same DB as the bot) on the Mongo node.",
+    "2) (Recommended) Replace the Bing/DuckDuckGo HTTP scraping with an official search API",
+    "   (SerpAPI, Bing Web Search API, Google CSE) for reliability \u2014 engines block scrapers.",
+    "3) Trigger it from the bot (HTTP call to the webhook) or on a schedule per niche.",
+    "",
+    "COMPLIANCE / NOTES:",
+    "- Scraping search engines & sites may violate their ToS and hit rate limits / Cloudflare.",
+    "  Prefer official APIs. Respect robots.txt and add delays.",
+    "- The regex only captures public @usernames; private invite links (t.me/+... , joinchat)",
+    "  are skipped (they can't be resolved by username). The bot verifies each is a real",
+    "  public GROUP before showing it.",
+    "- 'username' = the resolvable public handle; the bot resolves & filters to megagroups."
+  ]
+}
