@@ -173,6 +173,7 @@ logger_tokens_col = db['logger_tokens']
 admins_col = db['admins']
 settings_col = db['bot_settings']
 worker_health_col = db['worker_health']
+click_links_col = db['click_links']
 
 # ---- Global, admin-controlled settings (e.g. the per-group send frequency) ----
 # Frequency is a GLOBAL policy: default 3 sends/hour per group, hard-capped at 3.
@@ -238,6 +239,8 @@ def ensure_indexes():
         logger_tokens_col.create_index('account_id')
 
         admins_col.create_index('user_id', unique=True)
+        click_links_col.create_index('code', unique=True)
+        click_links_col.create_index('user_id')
     except Exception as e:
         print(f"[DB] Index creation failed: {e}")
 
@@ -1111,6 +1114,28 @@ def get_active_flood_waits(account_id):
 def generate_token(length=16):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
+# ---- Click tracking (opt-in; shown only via the dashboard Results button) ----
+# The actual redirect + click counting runs SIDE-BY-SIDE in n8n
+# (see n8n/click-tracker.workflow.json). The bot just creates tracked links and
+# reads the counts n8n writes into click_links.
+N8N_TRACK_BASE = os.getenv('N8N_TRACK_BASE', '').strip()  # e.g. https://your-n8n/webhook/r
+
+def create_tracked_link(user_id, target_url):
+    code = generate_token(8)
+    click_links_col.insert_one({
+        'code': code, 'user_id': int(user_id), 'target_url': target_url,
+        'clicks': 0, 'created_at': datetime.now(),
+    })
+    if N8N_TRACK_BASE:
+        sep = '&' if '?' in N8N_TRACK_BASE else '?'
+        return f"{N8N_TRACK_BASE}{sep}c={code}", code
+    return None, code
+
+def get_user_click_stats(user_id):
+    docs = list(click_links_col.find({'user_id': int(user_id)}, {'target_url': 1, 'clicks': 1}))
+    total = sum(d.get('clicks', 0) for d in docs)
+    return total, docs
+
 proxy_index = 0
 
 def get_next_proxy():
@@ -1632,6 +1657,98 @@ def spin(text):
         out = _SPINTAX_RE.sub(lambda m: random.choice(m.group(1).split('|')), out)
         guard += 1
     return out
+
+
+async def find_niche_groups(uid, keyword, limit=50):
+    """Search Telegram for public GROUPS matching a niche keyword, using one of
+    the user's logged-in accounts (bots can't do this search)."""
+    accs = list(accounts_col.find({'owner_id': uid}).limit(1))
+    if not accs:
+        return None, "no_account"
+    acc = accs[0]
+    try:
+        session = cipher_suite.decrypt(acc['session'].encode()).decode()
+    except Exception:
+        return None, "session_error"
+    client = make_account_client(session, acc['_id'])
+    found = []
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            return None, "unauthorized"
+        from telethon.tl.functions.contacts import SearchRequest
+        res = await client(SearchRequest(q=keyword, limit=limit))
+        seen = set()
+        for ch in getattr(res, 'chats', []) or []:
+            uname = getattr(ch, 'username', None)
+            if uname and getattr(ch, 'megagroup', False) and uname.lower() not in seen:
+                seen.add(uname.lower())
+                found.append({'username': uname, 'title': getattr(ch, 'title', uname) or uname})
+    except FloodWaitError as e:
+        return None, f"flood_{getattr(e, 'seconds', 0)}"
+    except Exception as e:
+        return None, f"error_{str(e)[:60]}"
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    return found, "ok"
+
+
+async def _join_groups_for_user(uid, usernames, chat_id, label="Joining groups"):
+    """Join a list of group usernames across all the user's accounts, paced and
+    FloodWait-safe, with the existing Stop (auto_join_cancel) support. Runs as a
+    background task so it never blocks the bot."""
+    accs = list(accounts_col.find({'owner_id': uid}))
+    if not accs or not usernames:
+        return
+    from telethon.tl.functions.channels import JoinChannelRequest
+    auto_join_cancel[uid] = False
+    joined = failed = 0
+    total = len(accs) * len(usernames)
+    delay = float(os.getenv('JOIN_DELAY', '4'))
+    try:
+        status = await main_bot.send_message(chat_id, f"<b>{label}…</b>\n0/{total}", parse_mode='html')
+    except Exception:
+        status = None
+    for acc in accs:
+        if auto_join_cancel.get(uid):
+            break
+        try:
+            session = cipher_suite.decrypt(acc['session'].encode()).decode()
+        except Exception:
+            continue
+        client = make_account_client(session, acc['_id'])
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                continue
+            for uname in usernames:
+                if auto_join_cancel.get(uid):
+                    break
+                try:
+                    ent = await client.get_entity(uname)
+                    await client(JoinChannelRequest(ent))
+                    joined += 1
+                except FloodWaitError as e:
+                    await asyncio.sleep(min(int(getattr(e, 'seconds', 60)) + 1, 600))
+                    continue
+                except Exception:
+                    failed += 1
+                await asyncio.sleep(delay + random.uniform(0, delay))
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+    if status:
+        try:
+            await main_bot.edit_message(chat_id, status.id,
+                f"<b>✅ {label} done</b>\nJoined: <code>{joined}</code>  Failed: <code>{failed}</code>",
+                parse_mode='html')
+        except Exception:
+            pass
 
 
 async def run_forwarding_loop(user_id, account_id):
@@ -2870,6 +2987,7 @@ def broadcast_menu_keyboard(user_id):
     return [
         [Button.inline("\u2699\uFE0F Settings", b"menu_settings"), Button.inline("\U0001F504 Mode", b"menu_fwd_mode")],
         [Button.inline("\u23F1\uFE0F Intervals", b"menu_interval"), Button.inline("\U0001F4CA Insights", b"menu_analytics")],
+        [Button.inline("\U0001F4C8 Results", b"menu_results")],
         [Button.inline(ads_btn, ads_data)],
         [Button.inline("\u2190 Back", b"enter_dashboard")],
     ]
@@ -6058,11 +6176,74 @@ async def callback(event):
                 "Send the .txt file now, or tap Back to cancel.",
                 parse_mode='html',
                 buttons=[
+                    [Button.inline("\U0001F50E Find Groups by Niche", b"find_groups")],
                     [Button.inline("\u2190 Back", b"menu_settings_automation")]
                 ]
             )
-            # Set user state to expect .txt file
             user_states[uid] = {'state': 'awaiting_group_join_file'}
+            return
+
+        if data == "find_groups":
+            if not is_premium(uid):
+                await event.answer("\u2B50 Paid plan feature only!", alert=True)
+                return
+            if not list(accounts_col.find({'owner_id': uid}).limit(1)):
+                await event.answer("\u274C Add an account first!", alert=True)
+                return
+            user_states[uid] = {'state': 'awaiting_niche_keyword'}
+            await event.edit(
+                "<b>\U0001F50E Find Groups by Niche</b>\n\n"
+                "<blockquote>Send a keyword/niche (e.g. <code>crypto</code>, <code>forex</code>, "
+                "<code>dropshipping</code>) and I'll search Telegram for public groups to join.</blockquote>",
+                parse_mode='html',
+                buttons=[[Button.inline("\u2190 Back", b"menu_auto_group_join")]]
+            )
+            return
+
+        if data == "join_found_groups":
+            _found = (user_states.get(uid, {}) or {}).get("found_groups") or []
+            if not _found:
+                await event.answer("Search again first.", alert=True)
+                return
+            user_states.pop(uid, None)
+            await event.edit(
+                f"<b>\u2795 Joining {len(_found)} groups\u2026</b>\n\n<i>Paced to stay safe; summary follows here.</i>",
+                parse_mode='html', buttons=[[Button.inline("\u23F9 Stop", b"auto_join_cancel")]]
+            )
+            asyncio.create_task(_join_groups_for_user(uid, _found, event.chat_id, "Joining found groups"))
+            return
+
+        if data == "menu_results":
+            accounts = get_user_accounts(uid)
+            sent = await db_call(bulk_total_sent, accounts)
+            clicks, links = await db_call(lambda: get_user_click_stats(uid))
+            lines = [f"<b>\U0001F4C8 Results</b>\n",
+                     f"<b>Ads sent:</b> <code>{sent}</code>",
+                     f"<b>Tracked clicks:</b> <code>{clicks}</code>",
+                     f"<b>Tracked links:</b> <code>{len(links)}</code>"]
+            if links:
+                lines.append("\n<b>Top links:</b>")
+                for d in sorted(links, key=lambda x: x.get('clicks', 0), reverse=True)[:5]:
+                    lines.append(f"\u2022 <code>{d.get('clicks',0)}</code> \u2014 {_h((d.get('target_url') or '')[:40])}")
+            if not N8N_TRACK_BASE:
+                lines.append("\n<i>Click tracking not configured (set N8N_TRACK_BASE + run the n8n workflow).</i>")
+            await event.edit("\n".join(lines), parse_mode='html', buttons=[
+                [Button.inline("\U0001F517 Create Tracked Link", b"create_tracked_link")],
+                [Button.inline("\u2190 Back", b"menu_broadcast")],
+            ])
+            return
+
+        if data == "create_tracked_link":
+            if not N8N_TRACK_BASE:
+                await event.answer("Click tracking isn't set up yet (admin: set N8N_TRACK_BASE).", alert=True)
+                return
+            user_states[uid] = {'state': 'awaiting_track_url'}
+            await event.edit(
+                "<b>\U0001F517 Create Tracked Link</b>\n\n"
+                "<blockquote>Send the URL you advertise (e.g. your channel/website). I'll give you a tracked "
+                "link to put in your ad \u2014 every click is counted in Results.</blockquote>",
+                parse_mode='html', buttons=[[Button.inline("\u2190 Back", b"menu_results")]]
+            )
             return
 
         if data == "logs_enable_global":
@@ -8010,24 +8191,83 @@ async def text_handler(event):
         return
     
     # ===================== Auto Group Join File Handler =====================
-    if state_type == 'awaiting_group_join_file':
-        # User should send a .txt file with group links
-        if not event.message.document:
-            await event.respond("📄 Please send a .txt file with group links (one per line).", parse_mode='html')
+    if state_type == 'awaiting_track_url':
+        url = (event.raw_text or event.text or '').strip()
+        if not (url.startswith('http://') or url.startswith('https://') or url.startswith('t.me/') or url.startswith('@')):
+            await event.respond("Send a valid URL (https://… or t.me/… or @username).")
             return
+        if url.startswith('@'):
+            url = f"https://t.me/{url[1:]}"
+        elif url.startswith('t.me/'):
+            url = f"https://{url}"
+        tracked, code = await db_call(lambda: create_tracked_link(uid, url))
+        user_states.pop(uid, None)
+        if not tracked:
+            await event.respond("Click tracking isn't configured yet (admin: set N8N_TRACK_BASE).")
+            return
+        await event.respond(
+            "<b>\u2705 Tracked link created</b>\n\n"
+            f"<b>Put this in your ad:</b>\n<code>{_h(tracked)}</code>\n\n"
+            "<i>Every click is counted under Results.</i>",
+            parse_mode='html',
+            buttons=[[Button.inline("\U0001F4C8 View Results", b"menu_results")]]
+        )
+        return
 
-        # Check if premium
+    if state_type == 'awaiting_niche_keyword':
+        keyword = (event.raw_text or event.text or '').strip()
+        if not keyword or len(keyword) < 2:
+            await event.respond("Send a keyword (at least 2 characters).")
+            return
+        await event.respond("🔎 Searching Telegram for groups…")
+        found, status = await find_niche_groups(uid, keyword, limit=int(os.getenv('FIND_GROUPS_LIMIT', '50')))
+        if status != 'ok':
+            user_states.pop(uid, None)
+            await event.respond(f"❌ Search failed: {status.replace('_', ' ')}")
+            return
+        if not found:
+            user_states.pop(uid, None)
+            await event.respond("No public groups found for that niche. Try a broader keyword.")
+            return
+        usernames = [g['username'] for g in found]
+        user_states[uid] = {'state': 'found_groups_ready', 'found_groups': usernames}
+        preview = "\n".join(f"• {(g['title'] or '')[:32]} (@{g['username']})" for g in found[:20])
+        more = f"\n…and {len(found) - 20} more" if len(found) > 20 else ""
+        await event.respond(
+            f"<b>🔎 Found {len(found)} groups for “{_h(keyword)}”</b>\n\n{_h(preview)}{more}",
+            parse_mode='html',
+            buttons=[[Button.inline(f"➕ Join All {len(found)} Found", b"join_found_groups")],
+                     [Button.inline("← Back", b"menu_auto_group_join")]]
+        )
+        return
+
+    if state_type == 'awaiting_group_join_file':
+        # Accept EITHER a .txt file OR pasted links (one per line) in the message.
         if not is_premium(uid):
             await event.respond("⭐ Paid plan feature only!")
             del user_states[uid]
             return
 
-        # Download file
         try:
-            file_path = await event.message.download_media()
+            raw_lines = []
+            if event.message.document:
+                file_path = await event.message.download_media()
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        raw_lines = f.read().splitlines()
+                finally:
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
+            else:
+                _txt = (event.raw_text or event.text or '')
+                if _txt.strip():
+                    raw_lines = _txt.splitlines()
 
-            with open(file_path, 'r', encoding='utf-8') as f:
-                raw_lines = f.read().splitlines()
+            if not raw_lines:
+                await event.respond("📄 Send a .txt file OR paste group links (one per line).", parse_mode='html')
+                return
 
             # Parse group links
             group_links = []
@@ -8047,11 +8287,6 @@ async def text_handler(event):
                 username = (username or '').strip().strip('/')
                 if username:
                     group_links.append(username)
-
-            try:
-                os.remove(file_path)
-            except Exception:
-                pass
 
             # Deduplicate while preserving order
             seen = set()

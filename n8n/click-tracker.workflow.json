@@ -1,0 +1,80 @@
+{
+  "name": "Jiren Ads - Click Tracker",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "r",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-in",
+      "name": "Redirect Webhook (/r?c=CODE)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [260, 300],
+      "webhookId": "jiren-click-tracker"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "collection": "click_links",
+        "updateKey": "code",
+        "fields": "clicks",
+        "options": { "upsert": false },
+        "query": "={{ JSON.stringify({ code: $json.query.c }) }}",
+        "updateFieldsUi": {}
+      },
+      "id": "mongo-inc",
+      "name": "Mongo: increment clicks",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1,
+      "position": [520, 300],
+      "notesInFlow": true,
+      "notes": "Use a Mongo update with {$inc:{clicks:1},$set:{last_click:now}} on {code: c}. If your n8n MongoDB node can't express $inc directly, replace this node with a 'Code' node running a mongodb client update, or an HTTP request to a tiny increment endpoint.",
+      "credentials": { "mongoDb": { "id": "REPLACE_MONGO_CRED_ID", "name": "Jiren Mongo" } }
+    },
+    {
+      "parameters": {
+        "operation": "find",
+        "collection": "click_links",
+        "query": "={{ JSON.stringify({ code: $json.query.c }) }}",
+        "options": { "limit": 1 }
+      },
+      "id": "mongo-find",
+      "name": "Mongo: lookup target_url",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1,
+      "position": [780, 300],
+      "credentials": { "mongoDb": { "id": "REPLACE_MONGO_CRED_ID", "name": "Jiren Mongo" } }
+    },
+    {
+      "parameters": {
+        "respondWith": "redirect",
+        "redirectURL": "={{ $json.target_url || 'https://t.me' }}",
+        "options": { "responseCode": 302 }
+      },
+      "id": "respond-redirect",
+      "name": "302 Redirect to target",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1040, 300]
+    }
+  ],
+  "connections": {
+    "Redirect Webhook (/r?c=CODE)": { "main": [[{ "node": "Mongo: increment clicks", "type": "main", "index": 0 }]] },
+    "Mongo: increment clicks": { "main": [[{ "node": "Mongo: lookup target_url", "type": "main", "index": 0 }]] },
+    "Mongo: lookup target_url": { "main": [[{ "node": "302 Redirect to target", "type": "main", "index": 0 }]] }
+  },
+  "settings": {},
+  "_README": [
+    "WHAT THIS DOES: a click-tracking redirect that runs SIDE-BY-SIDE with the bot.",
+    "Flow: user clicks https://YOUR-N8N-HOST/webhook/r?c=CODE  ->  increments click_links.clicks  ->  302-redirects to the real target_url.",
+    "SETUP:",
+    "1) Import this JSON into n8n. Set a MongoDB credential (same DB as the bot) on both Mongo nodes (replace REPLACE_MONGO_CRED_ID).",
+    "2) The bot writes docs to the 'click_links' collection: {code, user_id, target_url, clicks:0}.",
+    "3) The bot turns the advertiser's link into https://YOUR-N8N-HOST/webhook/r?c=CODE inside ads.",
+    "4) Set N8N_TRACK_BASE in the bot's .env to https://YOUR-N8N-HOST/webhook/r so it generates matching links.",
+    "NOTE: if your n8n MongoDB node version can't do $inc, swap 'Mongo: increment clicks' for a Code node that runs an update with {$inc:{clicks:1}}."
+  ]
+}
