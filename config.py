@@ -5,7 +5,7 @@ BOT_CONFIG = {
     'api_hash': os.getenv('TELEGRAM_API_HASH', '1092a61502cb8307ff429b0af7f404c3'),
     'bot_token': os.getenv('BOT_TOKEN', '8468153395:AAGIerNUX3cMAkSeADO9yiVNQ1MBrque3oc'),
     'owner_id': int(os.getenv('OWNER_ID', '1863750440')),
-    'mongo_uri': os.getenv('MONGO_URI', 'mongodb+srv://goku:goku@cluster0.ifnvez4.mongodb.net/gokuads_db?retryWrites=true&w=majority'),
+    'mongo_uri': os.getenv('MONGO_URI', 'mongodb+srv://Vansh:Kathait%40123@adbot.cv9soyo.mongodb.net/?appName=adbot'),
     'db_name': os.getenv('MONGO_DB_NAME', 'gokuads_db'),
     'logger_bot_token': os.getenv('LOGGER_BOT_TOKEN', '8544461885:AAF17504WmWwVdAJnEvpAA4ETiR9n6UG7Yo'),
     'logger_bot_username': os.getenv('LOGGER_BOT_USERNAME', 'jirenloggerbot'),
