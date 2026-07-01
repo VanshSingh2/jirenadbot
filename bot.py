@@ -215,6 +215,10 @@ def get_effective_target_per_hour():
         v = DEFAULT_TARGET_PER_HOUR
     return max(1, min(HARD_MAX_TARGET_PER_HOUR, v))
 
+def live_logs_enabled():
+    """Live per-send logging toggle (admin, runtime). Falls back to LIVE_SEND_LOGS env."""
+    return bool(get_global_setting('live_send_logs', LIVE_SEND_LOGS))
+
 def ensure_indexes():
     """Create MongoDB indexes (idempotent)."""
     try:
@@ -1731,7 +1735,7 @@ async def _tg_send_http(token, chat_id, text, url_button=None):
         return False
 
 
-async def send_log(account_id, message, view_link=None, group_name=None, delay_sec=None):
+async def send_log(account_id, message, view_link=None, group_name=None, delay_sec=None, ad_no=None, ad_total=None):
     """Send logs to the user's logs chat via the logger bot HTTP API. Multi-worker
     safe and low-load: one account fetch + a cached user-doc read (no per-call
     blocking find_one on the event loop like before)."""
@@ -1758,7 +1762,8 @@ async def send_log(account_id, message, view_link=None, group_name=None, delay_s
             delay_text = ""
             if delay_sec is not None and is_owner_admin:
                 delay_text = f"\n<b>Delay:</b> <code>{delay_sec:.2f}s</code>"
-            full_msg = f"<b>Sent to {_h(group_name)}</b>{account_text}{delay_text}"
+            ad_text = f"\n<b>Ad:</b> <code>#{ad_no} of {ad_total}</code>" if (ad_no and ad_total) else ""
+            full_msg = f"<b>Sent to {_h(group_name)}</b>{ad_text}{account_text}{delay_text}"
             await _tg_send_http(token, chat_id, full_msg,
                                 url_button=("View Message", view_link) if allow_view else None)
         elif message:
@@ -1779,13 +1784,13 @@ async def add_user_log(user_id, log_msg):
 # stall forwarding. Beyond LIVE_LOG_MAX_PENDING in-flight logs we simply drop them.
 _pending_live_logs = 0
 
-async def _fire_live_log(account_id, view_link, group_name, send_gap):
+async def _fire_live_log(account_id, view_link, group_name, send_gap, ad_no=None, ad_total=None):
     global _pending_live_logs
     if _pending_live_logs >= LIVE_LOG_MAX_PENDING:
         return
     _pending_live_logs += 1
     try:
-        await send_log(account_id, None, view_link=view_link, group_name=group_name, delay_sec=send_gap)
+        await send_log(account_id, None, view_link=view_link, group_name=group_name, delay_sec=send_gap, ad_no=ad_no, ad_total=ad_total)
     except Exception:
         pass
     finally:
@@ -2502,10 +2507,12 @@ async def run_forwarding_loop(user_id, account_id):
                         # of loop) instead of a DB write on every message.
                         # Live "sent to X" log is fire-and-forget + bounded so a slow
                         # or flood-limited logger bot never throttles forwarding.
-                        if LIVE_SEND_LOGS and sent_msg_id and current_entity:
+                        if live_logs_enabled() and sent_msg_id and current_entity:
                             view_link = build_message_link(current_entity, sent_msg_id, current_topic_id)
                             if view_link:
-                                asyncio.create_task(_fire_live_log(account_id, view_link, group_name, send_gap))
+                                _ad_no = (i % len(ads)) + 1 if (ads_mode == 'saved' and ads) else 1
+                                _ad_total = len(ads) if (ads_mode == 'saved' and ads) else 1
+                                asyncio.create_task(_fire_live_log(account_id, view_link, group_name, send_gap, _ad_no, _ad_total))
                         
                         # Stats are flushed once per round (see end of loop) to avoid
                         # a blocking DB write on every single message.
@@ -3661,6 +3668,8 @@ def interval_menu_keyboard(user_id):
     if is_admin(user_id):
         eff = get_effective_target_per_hour()
         rows.append([Button.inline(f"🎯 Frequency (admin): {eff}/hr", b"interval_freq")])
+        _ll = "✅ ON" if live_logs_enabled() else "❌ OFF"
+        rows.append([Button.inline(f"📝 Live Send Logs (admin): {_ll}", b"toggle_live_logs")])
     rows.append([Button.inline("Back", b"menu_broadcast")])
     return rows
 
@@ -5779,6 +5788,23 @@ async def callback(event):
                 buttons=[[Button.inline("← Back", b"menu_interval")]]
             )
             return
+        if data == "toggle_live_logs":
+            if not is_admin(uid):
+                await event.answer("Admin only.", alert=True)
+                return
+            new_val = not live_logs_enabled()
+            set_global_setting('live_send_logs', new_val)
+            await event.answer(f"Live send logs {'ON' if new_val else 'OFF'}", alert=True)
+            tph = get_effective_target_per_hour()
+            text = (
+                "<b>⏱️ Interval Settings</b>\n\n"
+                f"🎯 <b>Frequency:</b> <code>~{tph}/hour per group</code>\n"
+                f"📝 <b>Live Send Logs:</b> <code>{'ON' if new_val else 'OFF'}</code>\n\n"
+                "<i>Per-send logs show each group, ad #, and a View Message link. Keep OFF in production (they don't scale).</i>"
+            )
+            await event.edit(text, parse_mode='html', buttons=interval_menu_keyboard(uid))
+            return
+
         
         if data == "menu_topics":
             accounts = get_user_accounts(uid)
@@ -8243,6 +8269,20 @@ async def text_handler(event):
     action = state.get('action') if isinstance(state, dict) else None
     state_type = state.get('state') if isinstance(state, dict) else None
     
+    # Admin: set the global per-group send frequency (the Frequency button).
+    if action == 'set_target_freq':
+        if not is_admin(uid):
+            user_states.pop(uid, None)
+            return
+        if not text.isdigit():
+            await event.respond(f"Send a number between 1 and {HARD_MAX_TARGET_PER_HOUR}.")
+            return
+        val = max(1, min(HARD_MAX_TARGET_PER_HOUR, int(text)))
+        set_global_setting('target_per_hour', val)
+        user_states.pop(uid, None)
+        await event.respond(f"✅ Global frequency set to {val}/hr per group.")
+        return
+
     # ===================== Payment Screenshot Handler =====================
     if state_type == 'awaiting_payment_screenshot':
         # User should send a photo (payment screenshot)
