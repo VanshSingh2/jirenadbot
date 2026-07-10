@@ -279,3 +279,99 @@ Recommended: **~1000** = one 8 vCPU/16 GB box (or 2 nodes); **~2000** = 2–4 no
 - [ ] n8n behind basic-auth + localhost/SSH-tunnel (not open to the internet).
 - [ ] Proxies configured for your account count (~40/IP).
 - [ ] Firewall: only SSH open; Mongo and n8n stay private.
+
+
+---
+
+## 12. Environment variables — quick reference
+
+Copy `.env.example` → `.env` and fill it. `.env.example` has **every** variable with
+inline comments; below is the short version of what actually matters.
+
+### 12.1 REQUIRED — the bot won't work until these are set
+
+| Variable | What it is | Where to get it |
+|----------|-----------|-----------------|
+| `TELEGRAM_API_ID` | Telegram app id | [my.telegram.org](https://my.telegram.org) → API development tools |
+| `TELEGRAM_API_HASH` | Telegram app hash | same page |
+| `BOT_TOKEN` | Main dashboard/UI bot token | [@BotFather](https://t.me/BotFather) |
+| `LOGGER_BOT_TOKEN` | Bot that sends per-round logs to users | @BotFather (2nd bot) |
+| `NOTIFICATION_BOT_TOKEN` | Bot that sends admin alerts | @BotFather (3rd bot) |
+| `NOTIFICATION_CHANNEL_ID` | Channel for admin alerts (add the notif bot as admin) | looks like `-100…` |
+| `OWNER_ID` | Your numeric Telegram user id | [@userinfobot](https://t.me/userinfobot) |
+| `ENCRYPTION_KEY` | Fernet key encrypting stored sessions — **generate once, never change** | `python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"` |
+| `MONGO_URI` | DB connection string | self-hosted: `mongodb://USER:PASS@mongo:27017/gokuads_db?authSource=admin` |
+| `MONGO_DB_NAME` | Database name | e.g. `gokuads_db` |
+
+If you use the bundled Docker Mongo, also set:
+
+| Variable | What it is |
+|----------|-----------|
+| `MONGO_ROOT_USER` / `MONGO_ROOT_PASS` | Credentials for the `mongo` container (must match the user/pass in `MONGO_URI`) |
+| `MONGO_CACHE_GB` | WiredTiger cache cap (e.g. `1.5`; raise on bigger boxes) |
+
+### 12.2 STRONGLY RECOMMENDED at 100+ accounts
+
+| Variable | What it is |
+|----------|-----------|
+| `PROXY_LIST` | Sticky per-account proxies, `;`-separated. `type:host:port[:user:pass]`, type = socks5/socks4/http. ~40 accounts per IP. |
+
+### 12.3 OPTIONAL — the responsive AI ops-manager (`/manager` chat)
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `AI_API_KEY` | *(empty)* | Leave blank and `/manager` still answers status + applies explicit commands. Set it for full natural-language chat. |
+| `AI_PROVIDER` | `openai` | `openai` (also Groq/OpenRouter/Together via `AI_BASE_URL`), `anthropic`, or `gemini` |
+| `AI_MODEL` | provider default | e.g. `gpt-4o-mini`, `claude-3-5-haiku-latest`, `gemini-1.5-flash` |
+| `AI_BASE_URL` | *(empty)* | Only for OpenAI-compatible gateways, e.g. `https://api.groq.com/openai/v1` |
+
+### 12.4 OPTIONAL — multi-VPS (only when you add a 2nd machine)
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `NODE_COUNT` | `1` | Total VPS nodes — set the SAME on every box |
+| `NODE_ID` | `0` | Unique per box (0,1,2…). Must be `< NODE_COUNT` |
+| `RUN_UI` | auto | `1` on node 0 only (runs the Telegram UI bot); `0` on the rest |
+
+> All nodes must share ONE MongoDB and the SAME `ENCRYPTION_KEY`; each node needs its own `PROXY_LIST`.
+
+### 12.5 OPTIONAL — scaling knobs (good defaults; tune later or via `/manager`)
+
+`MAX_ACCOUNTS_PER_WORKER` (100), `PER_IP_CAP` (40), `MIN_WORKERS` (1), `MAX_WORKERS` (16),
+`MANAGER_INTERVAL` (60), `DB_THREAD_POOL` (64), `DEFAULT_TARGET_PER_HOUR` / `HARD_MAX_TARGET_PER_HOUR` (3),
+`WARMUP_ENABLED` (1), `TOXIC_PRUNE_DEFAULT` (1), `ENTITY_CACHE_MAX` (3000), `CACHE_SWEEP_INTERVAL` (300).
+You can change per-worker cap, per-IP cap, worker bounds, and frequency **live** from Telegram
+(`/setcap`, `/setproxycap`, `/setworkers`, `/manager`) — no restart needed.
+
+### 12.6 OPTIONAL — n8n integrations
+
+| Variable | What it is |
+|----------|-----------|
+| `N8N_TRACK_BASE` | Base URL of the n8n click-tracker webhook (turns advertiser links into trackable `?c=CODE` links). Import `n8n/click-tracker.workflow.json`. |
+| `N8N_PASSWORD` | Basic-auth password for the n8n container (see §4). |
+
+> **Group discovery** (§4) needs no bot env var — it's the n8n workflow writing to the
+> `discovered_groups` Mongo collection, which the bot's "🔎 Find Groups" reads.
+
+### 12.7 The absolute minimum to boot (copy-paste, then fill)
+
+```ini
+TELEGRAM_API_ID=
+TELEGRAM_API_HASH=
+BOT_TOKEN=
+LOGGER_BOT_TOKEN=
+NOTIFICATION_BOT_TOKEN=
+NOTIFICATION_CHANNEL_ID=-100
+OWNER_ID=
+ENCRYPTION_KEY=
+MONGO_ROOT_USER=jiren
+MONGO_ROOT_PASS=change-me-strong
+MONGO_URI=mongodb://jiren:change-me-strong@mongo:27017/gokuads_db?authSource=admin
+MONGO_DB_NAME=gokuads_db
+MONGO_CACHE_GB=1.5
+# add when you have 100+ accounts:
+PROXY_LIST=
+# optional, for AI /manager chat:
+AI_API_KEY=
+```
+Then: `docker compose up -d --build` → open the bot → `/start`. Full steps in §1–§6.
