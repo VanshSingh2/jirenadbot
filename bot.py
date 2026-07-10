@@ -1306,7 +1306,15 @@ def make_account_client(session, account_id=None):
     )
 
 
-# ---- Worker sharding (lets you run multiple forwarding processes later) ----
+# ---- Node + worker sharding (horizontal scaling across machines AND processes) ----
+# Two levels of deterministic, coordination-free sharding:
+#   1. NODE level  -> splits the whole fleet across VPS machines (NODE_COUNT).
+#   2. WORKER level -> splits a node's slice across its local processes (WORKER_COUNT).
+# To add a VPS: bump NODE_COUNT on every machine and give the new box a fresh
+# NODE_ID. Accounts rebalance automatically because ownership is a pure hash of
+# the account id -> no registry, no leader election, no cross-node chatter.
+NODE_ID = int(os.getenv('NODE_ID', '0'))
+NODE_COUNT = max(1, int(os.getenv('NODE_COUNT', '1')))
 WORKER_COUNT = max(1, int(os.getenv('WORKER_COUNT', '1')))
 WORKER_ID = int(os.getenv('WORKER_ID', '0'))
 BOT_ROLE = os.getenv('BOT_ROLE', 'all').strip().lower()   # all | bot | worker
@@ -1361,13 +1369,25 @@ LIVE_SEND_LOGS = os.getenv('LIVE_SEND_LOGS', '0').strip().lower() in ('1', 'true
 LIVE_LOG_MAX_PENDING = int(os.getenv('LIVE_LOG_MAX_PENDING', '200'))
 
 
+def _node_owns_account(account_id):
+    """Which VPS node owns this account. With NODE_COUNT=1 (single machine)
+    every account belongs to this node."""
+    if NODE_COUNT <= 1:
+        return True
+    return (_stable_hash(account_id) % NODE_COUNT) == (NODE_ID % NODE_COUNT)
+
+
 def _owns_account(account_id):
     """Does THIS process own (forward) the given account?
     - role 'bot' never forwards.
-    - otherwise, shard accounts across WORKER_COUNT by a stable hash."""
+    - first shard by VPS node (NODE_COUNT), then by worker within the node
+      (WORKER_COUNT). The worker hash is salted so it does not correlate with the
+      node split (accounts stay evenly spread across a node's workers)."""
     if BOT_ROLE == 'bot':
         return False
-    return (_stable_hash(account_id) % WORKER_COUNT) == (WORKER_ID % WORKER_COUNT)
+    if not _node_owns_account(account_id):
+        return False
+    return (_stable_hash('w:' + str(account_id)) % WORKER_COUNT) == (WORKER_ID % WORKER_COUNT)
 
 
 def parse_link(link):
@@ -2853,8 +2873,8 @@ async def _reconcile_once():
 
 async def forwarding_reconciler():
     """Background loop that keeps local forwarding aligned with desired state."""
-    print(f"[RECONCILE] Reconciler started (worker {WORKER_ID}/{WORKER_COUNT}, "
-          f"role={BOT_ROLE}, interval={RECONCILE_INTERVAL}s)")
+    print(f"[RECONCILE] Reconciler started (node {NODE_ID}/{NODE_COUNT}, "
+          f"worker {WORKER_ID}/{WORKER_COUNT}, role={BOT_ROLE}, interval={RECONCILE_INTERVAL}s)")
     while True:
         try:
             await _reconcile_once()
@@ -2876,7 +2896,8 @@ async def health_logger():
             await asyncio.sleep(interval)
             active_local = sum(1 for t in forwarding_tasks.values() if not t.done())
             print(
-                f"[HEALTH] role={BOT_ROLE} worker={WORKER_ID}/{WORKER_COUNT} "
+                f"[HEALTH] role={BOT_ROLE} node={NODE_ID}/{NODE_COUNT} "
+                f"worker={WORKER_ID}/{WORKER_COUNT} "
                 f"local_active_accounts={active_local} proxies={len(RUNTIME_PROXIES)} "
                 f"uptime={_format_duration(int(time.time() - BOT_START_TIME))}"
             )
@@ -2909,7 +2930,12 @@ async def health_reporter():
             for k in _HEALTH:
                 _HEALTH[k] = 0
             active_local = sum(1 for t in forwarding_tasks.values() if not t.done())
+            # Globally-unique key per (node, worker) so multiple VPS nodes each
+            # running a "worker 0" don't clobber each other's health doc.
+            wkey = f"{NODE_ID}:{WORKER_ID}"
             doc = {
+                'wkey': wkey,
+                'node_id': NODE_ID,
                 'worker_id': WORKER_ID,
                 'role': BOT_ROLE,
                 'updated_at': datetime.now(),
@@ -2922,7 +2948,7 @@ async def health_reporter():
                 'timeouts': window.get('timeouts', 0),
             }
             await db_call(lambda: worker_health_col.update_one(
-                {'worker_id': WORKER_ID}, {'$set': doc}, upsert=True))
+                {'wkey': wkey}, {'$set': doc}, upsert=True))
         except asyncio.CancelledError:
             raise
         except Exception as e:

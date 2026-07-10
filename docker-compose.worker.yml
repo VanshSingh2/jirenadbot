@@ -1,0 +1,31 @@
+# Secondary VPS node (WORKERS ONLY) for multi-VPS horizontal scaling.
+# Run this on every ADDITIONAL box (node 1, 2, 3, ...). It runs manager.py in
+# workers-only mode (RUN_UI=0) and does NOT run its own MongoDB — every node in
+# the cluster MUST share ONE database (node 0's Mongo reached over a private
+# network/VPN, or a managed cluster like Atlas).
+#
+# On THIS box's .env set (see SETUP.md "Scaling to 1000-2000 accounts"):
+#   NODE_COUNT=<total number of nodes>     # identical on every node
+#   NODE_ID=<this box's index>             # unique: 1, 2, 3, ...
+#   RUN_UI=0                               # only node 0 runs the Telegram UI bot
+#   MONGO_URI=mongodb://USER:PASS@<shared-mongo-host>:27017/gokuads_db?authSource=admin
+#   ENCRYPTION_KEY=<EXACT same key as node 0>   # required so sessions decrypt
+#   PROXY_LIST=<this node's OWN proxies>        # each node needs its own IPs
+#
+# then:  docker compose -f docker-compose.worker.yml up -d --build
+
+services:
+  jirenadbot:
+    build: .
+    image: jirenadbot:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./session:/app/session        # local session cache for this node's shard
+    stop_grace_period: 30s
+    # Optional: match limits to the box so the auto-cap math is accurate.
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "4"
+    #       memory: 8g

@@ -310,3 +310,119 @@ Also back up your `.env` (it holds the irreplaceable `ENCRYPTION_KEY`) somewhere
 - [ ] `.env` stays git-ignored (it is) and is never committed.
 - [ ] VPS firewall allows only SSH (and n8n's port if you use it); Mongo stays internal.
 - [ ] Clean residential/mobile proxies configured for 100+ accounts.
+
+---
+
+## 12. Scaling to 1000–2000 accounts (single box vs. multi-VPS)
+
+You have **two levers**, and the manager will DM you which one to pull:
+
+- **Vertical** — give the current VPS more RAM / vCPU.
+- **Horizontal** — add another VPS node. Accounts are sharded across machines by a
+  stable hash of the account id, so each box independently runs ~`1/NODE_COUNT`
+  of the fleet with **no cross-node coordination**.
+
+### 12.1 Roughly where each option lands
+
+| Accounts | Simplest path | Notes |
+|----------|---------------|-------|
+| ≤ 500    | 1 VPS (4 vCPU / 8 GB) | Vertical only. |
+| ~1000    | 1 big VPS (8 vCPU / 16 GB) **or** 2 nodes | Either works; 2 nodes = less blast radius. |
+| ~2000    | **2–4 VPS nodes** (each 4 vCPU / 8 GB) | Horizontal is cheaper & more resilient than one huge box. |
+
+RAM is the real cap (~15 MB/account). One 16 GB box tops out near ~1000 active
+accounts; beyond that, adding nodes is the clean path.
+
+### 12.2 How multi-VPS works here
+
+- Set the **same `NODE_COUNT`** on every machine and a **unique `NODE_ID`** (0,1,2,…).
+- **Node 0 runs the Telegram UI bot** (`RUN_UI=1`); every other node is **workers-only**
+  (`RUN_UI=0`) — a bot token can only long-poll from one process.
+- **All nodes share ONE MongoDB** and **must use the exact same `ENCRYPTION_KEY`**
+  (so any node can decrypt any account's session).
+- **Each node needs its own proxies** (`PROXY_LIST`) — proxies are not shared across boxes.
+- The manager on each node counts only the accounts it owns and scales its own workers.
+
+### 12.3 Add-a-VPS runbook (going from 1 node to 2)
+
+**On node 0** (existing box) — make its Mongo reachable by the new node over a
+**private network / VPN (WireGuard/Tailscale)**, never the public internet. Then:
+```ini
+# node 0 .env
+NODE_COUNT=2
+NODE_ID=0
+RUN_UI=1
+```
+```bash
+docker compose up -d          # picks up NODE_COUNT=2; it now owns ~half the fleet
+```
+
+**On node 1** (new box):
+```bash
+git clone https://github.com/VanshSingh2/jirenadbot.git && cd jirenadbot
+cp .env.example .env
+nano .env
+```
+```ini
+# node 1 .env
+NODE_COUNT=2
+NODE_ID=1
+RUN_UI=0
+ENCRYPTION_KEY=<EXACT same key as node 0>
+MONGO_URI=mongodb://USER:PASS@<node0-private-ip>:27017/gokuads_db?authSource=admin
+MONGO_DB_NAME=gokuads_db
+PROXY_LIST=<node 1's own proxies>
+# (all the Telegram tokens/OWNER_ID too — same values as node 0)
+```
+```bash
+docker compose -f docker-compose.worker.yml up -d --build
+```
+That's it. Accounts rebalance automatically (~half move to node 1). To add a 3rd
+node later: bump `NODE_COUNT=3` everywhere, boot the new box with `NODE_ID=2`.
+
+> **Shared Mongo options:** (a) node 0's self-hosted Mongo exposed only on the
+> private VPN, or (b) a managed cluster (Atlas M10+). For 1000–2000 accounts a
+> dedicated/managed DB is the safer choice.
+
+### 12.4 The manager tells you when to scale
+
+Every cycle the manager checks this node's headroom and DMs the admin (with a
+per-topic cooldown so it never spams):
+
+- **"RAM filling up"** → increase this VPS's RAM to ~N GB, or add a VPS.
+- **"Worker/CPU ceiling"** → add vCPU + raise `MAX_WORKERS`, or add a VPS.
+- **"High CPU"** → sustained load per core is high → add cores, or add a VPS.
+- **"Node near capacity"** (95%+) → clear call to **add a VPS** (`NODE_COUNT=N+1`).
+- **"Proxy capacity"** → add ~K proxies to `PROXY_LIST` (this already existed).
+
+So you don't have to watch dashboards — act on the DM it sends.
+
+---
+
+## 13. "How many workers will I actually get?" (vCPU ≠ workers)
+
+Worker count is driven by **accounts**, not cores:
+
+```
+workers_on_this_node = ceil(node_active_accounts / MAX_ACCOUNTS_PER_WORKER)   # capped by MAX_WORKERS
+```
+
+- **RAM** decides the *total* accounts a box can hold (~15 MB each).
+- **vCPU** decides how many worker processes run comfortably in parallel; the
+  design targets ~1 process per core, but forwarding is **I/O-bound** (mostly
+  waiting on Telegram), so one core easily handles several worker processes.
+- There is always **1 extra UI-bot process** on node 0 that does not forward.
+
+Examples (default `MAX_ACCOUNTS_PER_WORKER=100`):
+
+| Box / node | Active accounts on node | Forwarding workers | + UI bot |
+|------------|-------------------------|--------------------|----------|
+| 2 vCPU / 4 GB | ~100 | 1 | +1 (node 0) |
+| 4 vCPU / 8 GB | ~500 | 5 | +1 (node 0) |
+| 8 vCPU / 16 GB | ~1000 | 10 | +1 (node 0) |
+| 2× (4 vCPU / 8 GB) | ~2000 (≈1000/node) | 10 per node | +1 on node 0 only |
+
+So at 500 accounts you already have *more* worker processes (5) than the "1 per
+vCPU" intuition suggests — that's expected and fine. Tune with
+`MAX_ACCOUNTS_PER_WORKER` (smaller = more, lighter workers) and `MAX_WORKERS`
+(hard ceiling, default 16).

@@ -19,14 +19,20 @@ What it does, every MANAGER_INTERVAL seconds:
      via the Telegram Bot API asking you to add more proxies (it cannot create
      proxies itself).
 
-Scaling across MULTIPLE machines is out of scope here (use one manager per box,
-or Kubernetes). This manager scales workers on the box it runs on.
+Scaling across MULTIPLE machines (VPS nodes) IS supported: run one manager per
+box with a shared NODE_COUNT and a unique NODE_ID (0-based). Accounts are sharded
+across nodes by a stable hash of the account id, so each box independently owns
+and runs ~1/NODE_COUNT of the fleet with no cross-node coordination. The UI bot
+runs on node 0 only (RUN_UI). The manager also DMs the admin when the box is
+running low on RAM, CPU, worker slots, or proxies, and when it's time to add
+another VPS node.
 """
 import os
 import sys
 import time
 import math
 import signal
+import hashlib
 import subprocess
 from datetime import datetime, timedelta
 
@@ -86,6 +92,23 @@ PER_IP_CAP = int(os.getenv('PER_IP_CAP', '40'))
 MIN_WORKERS = int(os.getenv('MIN_WORKERS', '1'))
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', '16'))
 MANAGER_INTERVAL = int(os.getenv('MANAGER_INTERVAL', '60'))
+
+# ---- Multi-VPS (horizontal) scaling ----
+# Each machine runs its own manager. NODE_COUNT is the total number of VPS nodes;
+# NODE_ID is THIS machine's 0-based index. With NODE_COUNT=1 nothing changes.
+NODE_ID = int(os.getenv('NODE_ID', '0'))
+NODE_COUNT = max(1, int(os.getenv('NODE_COUNT', '1')))
+# Only ONE machine may run the Telegram UI bot (a bot token can only long-poll
+# from one process). Defaults to ON for node 0, OFF for the rest.
+RUN_UI = os.getenv('RUN_UI', '1' if NODE_ID == 0 else '0').strip().lower() in ('1', 'true', 'yes', 'on')
+
+# ---- Capacity advisor (DMs admin which lever to pull) ----
+CAP_WARN_FILL = float(os.getenv('CAP_WARN_FILL', '0.85'))   # warn at this fraction of node capacity
+CAP_CRIT_FILL = float(os.getenv('CAP_CRIT_FILL', '0.95'))   # "add a VPS" at this fraction
+CPU_WARN_LOAD = float(os.getenv('CPU_WARN_LOAD', '0.85'))   # per-core 5-min load avg to warn
+CPU_WARN_CYCLES = int(os.getenv('CPU_WARN_CYCLES', '3'))    # consecutive hot cycles before alerting
+ADVISOR_INTERVAL = int(os.getenv('ADVISOR_INTERVAL', '3600'))  # min seconds between same-topic DMs
+CAP_TARGET_FILL = float(os.getenv('CAP_TARGET_FILL', '0.70'))  # sizing recommendations aim for this fill
 # Scale down only after this many consecutive "could be smaller" checks (anti-flap).
 DOWN_STABLE_CYCLES = int(os.getenv('DOWN_STABLE_CYCLES', '5'))
 # Re-alert about proxies at most this often (seconds).
@@ -133,6 +156,8 @@ _last_cap_change = 0.0
 _last_flood_alert = 0.0
 _last_proxy_alert = 0.0
 _last_proxy_alert_needed = 0
+_advice_state = {}   # topic -> {'last': ts, 'metric': float} for de-duping capacity DMs
+_cpu_hot = 0         # consecutive high-CPU cycles
 _stop = False
 
 
@@ -169,6 +194,9 @@ def alert_admin(text):
 def _spawn(role, worker_id=None, worker_count=None):
     env = dict(os.environ)
     env['BOT_ROLE'] = role
+    # Propagate this node's identity so child processes shard within the node.
+    env['NODE_ID'] = str(NODE_ID)
+    env['NODE_COUNT'] = str(NODE_COUNT)
     if role == 'worker':
         env['WORKER_ID'] = str(worker_id)
         env['WORKER_COUNT'] = str(worker_count)
@@ -211,9 +239,22 @@ def _set_worker_count(n):
 
 
 def _ensure_bot_alive():
+    if not RUN_UI:
+        return  # UI bot lives on node 0 only; this node runs workers only.
     p = _procs.get('bot')
     if p is None or p.poll() is not None:
         _procs['bot'] = _spawn('bot')
+
+
+def _stable_hash(value):
+    """Same hash the bot uses for account ownership (keep in sync with bot.py)."""
+    return int(hashlib.md5(str(value).encode()).hexdigest(), 16)
+
+
+def _node_owns(account_id):
+    if NODE_COUNT <= 1:
+        return True
+    return (_stable_hash(account_id) % NODE_COUNT) == (NODE_ID % NODE_COUNT)
 
 
 def _respawn_dead_workers():
@@ -234,7 +275,11 @@ def _read_health():
     agg = {'sends': 0, 'fails': 0, 'floods': 0, 'peerfloods': 0, 'timeouts': 0}
     try:
         cutoff = datetime.now() - timedelta(seconds=HEALTH_STALE_SECONDS)
-        for d in _health.find({'updated_at': {'$gte': cutoff}}):
+        # Only this node's workers (each node's manager adapts independently).
+        q = {'updated_at': {'$gte': cutoff}}
+        if NODE_COUNT > 1:
+            q['node_id'] = NODE_ID
+        for d in _health.find(q):
             for k in agg:
                 agg[k] += int(d.get(k, 0) or 0)
     except Exception as e:
@@ -346,8 +391,122 @@ def _check_proxies(active):
     print(f"[MANAGER] Proxy alert sent (active={active}, ips={effective_ips}, needed={needed_ips})")
 
 
+def _advise(topic, message, metric):
+    """DM the admin at most once per ADVISOR_INTERVAL per topic, or sooner if the
+    situation got materially worse (metric increased). Prevents alert spam while
+    still escalating when things degrade."""
+    st = _advice_state.get(topic, {'last': 0.0, 'metric': -1.0})
+    now = time.time()
+    if (now - st['last']) < ADVISOR_INTERVAL and metric <= st['metric'] + 1e-9:
+        return
+    _advice_state[topic] = {'last': now, 'metric': metric}
+    alert_admin(message)
+    print(f"[MANAGER] advisory[{topic}] sent (metric={metric:.2f})")
+
+
+def _recommend_ram_gb(n_accounts):
+    """GB of RAM to comfortably run n_accounts at CAP_TARGET_FILL headroom."""
+    mb = (n_accounts * PER_ACCOUNT_MB) / max(0.1, CAP_TARGET_FILL) + RAM_RESERVE_MB
+    return max(1, math.ceil(mb / 1024))
+
+
+def _cpu_load_ratio(cpu):
+    """5-minute load average per core (0..1+). 0 if unavailable (e.g. Windows)."""
+    try:
+        return os.getloadavg()[1] / max(1, cpu)
+    except (OSError, AttributeError):
+        return 0.0
+
+
+def _node_label():
+    return f"node {NODE_ID + 1}/{NODE_COUNT}"
+
+
+def _capacity_advisor(owned):
+    """Look at THIS node's headroom and DM the admin the specific lever to pull:
+    add RAM, add vCPU/cores, add a whole VPS node, (proxies handled separately).
+    `owned` = active accounts this node is running."""
+    global _cpu_hot
+    cpu, total_mb = _machine_info()
+    usable = max(1.0, total_mb - RAM_RESERVE_MB)
+    ram_cap = max(1, int(usable / PER_ACCOUNT_MB))              # accounts RAM can hold
+    worker_cap = max(1, MAX_WORKERS * MAX_ACCOUNTS_PER_WORKER)  # accounts all workers can hold
+    node_cap = min(ram_cap, worker_cap)                        # binding capacity
+    fill = owned / node_cap
+
+    # ---- Box near its TOTAL ceiling -> recommend adding a VPS (horizontal) ----
+    if fill >= CAP_CRIT_FILL:
+        target_gb = _recommend_ram_gb(owned)
+        vertical = f"scale this box to ~{target_gb} GB RAM"
+        if worker_cap <= ram_cap:
+            vertical += " and more vCPU (raise MAX_WORKERS)"
+        _advise(
+            'add_node',
+            "🚨 Jiren Ads Bot — NODE NEAR CAPACITY\n\n"
+            f"{_node_label()} is running {owned} of ~{node_cap} safe accounts "
+            f"({fill * 100:.0f}% full).\n\n"
+            "Do ONE of these:\n"
+            f"• ADD A VPS (recommended): set NODE_COUNT={NODE_COUNT + 1} on every node, "
+            f"then boot the new box with NODE_ID={NODE_COUNT}. Accounts auto-rebalance.\n"
+            f"• Or {vertical}.",
+            fill,
+        )
+        return  # the critical alert already tells them everything; don't double-DM
+
+    # ---- Warn zone: point at the specific binding resource ----
+    if fill >= CAP_WARN_FILL:
+        if ram_cap <= worker_cap:
+            target_gb = _recommend_ram_gb(owned)
+            _advise(
+                'ram',
+                "⚠️ Jiren Ads Bot — RAM FILLING UP\n\n"
+                f"{_node_label()}: {owned} active accounts vs safe RAM capacity ~{ram_cap} "
+                f"(~{PER_ACCOUNT_MB:.0f} MB/account).\n\n"
+                f"➡️ Increase this VPS to ~{target_gb} GB RAM, "
+                f"or add a VPS (NODE_COUNT={NODE_COUNT + 1}).",
+                fill,
+            )
+        else:
+            _advise(
+                'cores',
+                "⚠️ Jiren Ads Bot — WORKER/CPU CEILING\n\n"
+                f"{_node_label()}: {owned} accounts, but only MAX_WORKERS={MAX_WORKERS} × "
+                f"{MAX_ACCOUNTS_PER_WORKER}/worker = {worker_cap} can run here.\n\n"
+                f"➡️ Add vCPU cores and raise MAX_WORKERS, "
+                f"or add a VPS (NODE_COUNT={NODE_COUNT + 1}).",
+                fill,
+            )
+
+    # ---- Sustained high CPU load -> recommend more cores ----
+    load_ratio = _cpu_load_ratio(cpu)
+    if load_ratio >= CPU_WARN_LOAD:
+        _cpu_hot += 1
+    else:
+        _cpu_hot = 0
+    if _cpu_hot >= CPU_WARN_CYCLES:
+        _advise(
+            'cpu',
+            "⚠️ Jiren Ads Bot — HIGH CPU\n\n"
+            f"{_node_label()}: 5-min load ~{load_ratio * 100:.0f}% per core ({cpu} vCPU) "
+            f"for several minutes.\n\n"
+            f"➡️ Add vCPU cores to this VPS, or add a VPS (NODE_COUNT={NODE_COUNT + 1}).",
+            load_ratio,
+        )
+        _cpu_hot = 0
+
+
 def _count_active():
-    return _accounts.count_documents({'is_forwarding': True})
+    """Return (owned_by_this_node, fleet_total) active forwarding accounts.
+    On a single node we use a cheap count; multi-node fetches ids to shard."""
+    if NODE_COUNT <= 1:
+        n = _accounts.count_documents({'is_forwarding': True})
+        return n, n
+    owned = total = 0
+    for d in _accounts.find({'is_forwarding': True}, {'_id': 1}):
+        total += 1
+        if _node_owns(d['_id']):
+            owned += 1
+    return owned, total
 
 
 def _handle_signal(signum, frame):
@@ -364,19 +523,24 @@ def main():
     print("Jiren Ads Bot — Auto-Scaling Manager")
     _cpu, _ram = _machine_info()
     _how = "auto" if _AUTO_WORKER_CAP else "fixed"
+    print(f"node: {NODE_ID + 1}/{NODE_COUNT} | run_ui={RUN_UI}")
     print(f"machine: {_cpu} CPU, {_ram/1024:.1f} GB RAM | cap/worker={MAX_ACCOUNTS_PER_WORKER} ({_how}, baseline {_CONFIGURED_CAP})")
     print(f"per_ip_cap={PER_IP_CAP} workers[{MIN_WORKERS}..{MAX_WORKERS}] interval={MANAGER_INTERVAL}s")
     print("=" * 50)
+    if not RUN_UI:
+        print("[MANAGER] RUN_UI=0 -> workers-only node (UI bot runs on node 0).")
 
     _ensure_bot_alive()
-    _set_worker_count(_desired_workers(_safe_count()))
+    _owned0, _ = _safe_count()
+    _set_worker_count(_desired_workers(_owned0))
 
     while not _stop:
         try:
             _ensure_bot_alive()
             _respawn_dead_workers()
 
-            active = _safe_count()
+            # active = accounts THIS node owns; total = whole fleet (for context).
+            active, total = _safe_count()
 
             # Health-adaptive: shrink/grow accounts-per-worker from runtime errors.
             cap_changed = _adapt_cap()
@@ -403,6 +567,7 @@ def main():
                 _down_counter = 0
 
             _check_proxies(active)
+            _capacity_advisor(active)
         except Exception as e:
             print(f"[MANAGER] Loop error: {e}")
         # Sleep in small steps so signals are handled promptly.
@@ -422,7 +587,7 @@ def _safe_count():
         return _count_active()
     except Exception as e:
         print(f"[MANAGER] active count failed: {e}")
-        return 0
+        return 0, 0
 
 
 if __name__ == '__main__':
