@@ -185,6 +185,125 @@ Updates do not log accounts out or lose data (as long as `ENCRYPTION_KEY` is unc
 
 ---
 
+## 4B. Path C — Native on the VPS: local MongoDB + systemd (24/7, auto-restart)
+
+Use this if you want the bot and MongoDB running **directly on the VPS** (no
+Docker), started on boot and kept alive by **systemd**. MongoDB runs **locally on
+the box** (bound to `127.0.0.1` — never exposed to the internet).
+
+### 4B.1 Install MongoDB locally (systemd-managed)
+Ubuntu (auto-detects your release codename):
+```bash
+sudo apt-get update && sudo apt-get install -y gnupg curl lsb-release
+curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | \
+  sudo gpg -o /usr/share/keyrings/mongodb-server-8.0.gpg --dearmor
+echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/ubuntu $(lsb_release -cs)/mongodb-org/8.0 multiverse" | \
+  sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+sudo apt-get update && sudo apt-get install -y mongodb-org
+sudo systemctl enable --now mongod        # start now + auto-start on every boot
+systemctl status mongod --no-pager        # should be: active (running)
+```
+MongoDB listens only on `127.0.0.1:27017` by default — keep it that way (no
+internet exposure, so localhost needs no password).
+
+(Optional) cap its RAM — edit `/etc/mongod.conf`:
+```yaml
+storage:
+  wiredTiger:
+    engineConfig:
+      cacheSizeGB: 1.5
+```
+then `sudo systemctl restart mongod`.
+
+### 4B.2 Install the bot in a venv
+```bash
+sudo apt-get install -y python3-venv git
+cd /opt && sudo git clone https://github.com/VanshSingh2/jirenadbot.git
+cd jirenadbot
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp .env.example .env
+python3 -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"   # -> ENCRYPTION_KEY
+nano .env
+```
+
+### 4B.3 `.env` for local MongoDB
+Point the bot at the **local** Mongo and fill your Telegram values + the key.
+(Replace every `<...>` with your **rotated** value — see §2.)
+```ini
+# --- local MongoDB on this VPS (no auth needed; localhost-only) ---
+MONGO_URI=mongodb://localhost:27017/gokuads_db
+MONGO_DB_NAME=gokuads_db
+
+# --- Telegram ---
+TELEGRAM_API_ID=<your api id>
+TELEGRAM_API_HASH=<your rotated api hash>
+BOT_TOKEN=<your rotated main bot token>
+LOGGER_BOT_TOKEN=<your rotated logger bot token>
+NOTIFICATION_BOT_TOKEN=<your rotated notification bot token>
+NOTIFICATION_CHANNEL_ID=<your channel id, e.g. -100...>
+OWNER_ID=<your numeric telegram id>
+ENCRYPTION_KEY=<the key you generated above — keep it forever>
+
+# --- add when you have 100+ accounts ---
+PROXY_LIST=
+```
+> The bot loads `.env` automatically (python-dotenv), so you do **not** need
+> systemd `EnvironmentFile`. Keep secrets in `.env` only (never `config.py`).
+> `.env` is git-ignored — it stays on this VPS.
+
+### 4B.4 Create the systemd service (24/7 + auto-restart)
+```bash
+sudo tee /etc/systemd/system/jirenadbot.service >/dev/null <<'UNIT'
+[Unit]
+Description=Jiren Ads Bot (auto-scaling manager)
+After=network-online.target mongod.service
+Wants=network-online.target
+Requires=mongod.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/jirenadbot
+ExecStart=/opt/jirenadbot/.venv/bin/python manager.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=45
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now jirenadbot     # start now + on every boot
+```
+`Restart=always` brings the bot back if it ever crashes; `Requires/After=mongod`
+makes it start after MongoDB. Both `mongod` and `jirenadbot` are enabled, so the
+whole stack comes back automatically after a reboot — true 24/7.
+
+> `manager.py` gives auto-scaling workers + `/health` + `/manager`. To run the
+> simple single process instead, set `ExecStart=/opt/jirenadbot/.venv/bin/python bot.py`.
+
+### 4B.5 Operate it
+```bash
+systemctl status jirenadbot --no-pager     # health
+journalctl -u jirenadbot -f                # live logs (Ctrl+C to stop watching)
+sudo systemctl restart jirenadbot          # restart
+sudo systemctl stop jirenadbot             # stop
+# update to latest code:
+cd /opt/jirenadbot && sudo git pull && .venv/bin/pip install -r requirements.txt && sudo systemctl restart jirenadbot
+```
+Backup the local DB:
+```bash
+mongodump --db gokuads_db --archive=/root/backup-$(date +%F).gz --gzip
+```
+> Firewall: keep only SSH open; MongoDB stays on localhost. Sessions persist in
+> `/opt/jirenadbot/session/`; never change `ENCRYPTION_KEY`.
+
+---
+
 ## 5. Sizing the VPS (this is the part that decides "no lag")
 
 RAM budget ≈ **~15 MB per connected account** + Mongo cache + ~1 GB OS overhead.
