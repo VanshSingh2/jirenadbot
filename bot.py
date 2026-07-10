@@ -226,6 +226,10 @@ def ensure_indexes():
         users_col.create_index('username')
 
         accounts_col.create_index('owner_id')
+        # Admin "all users" view sorts by created_at desc; account lists sort by
+        # added_at within an owner. Without these, both were COLLSCAN + in-mem sort.
+        users_col.create_index('created_at')
+        accounts_col.create_index([('owner_id', 1), ('added_at', 1)])
         accounts_col.create_index([('owner_id', 1), ('is_forwarding', 1)])
         # The reconciler/manager query is_forwarding directly every cycle. Without a
         # leading-is_forwarding index these were COLLECTION SCANS at scale. This
@@ -653,6 +657,25 @@ def invalidate_admin_cache(user_id=None):
 def invalidate_logs_cache():
     with _cache_lock:
         _logs_chat_cache.clear()
+
+
+async def cache_sweeper():
+    """Periodically purge EXPIRED TTL-cache entries. Without this, the caches only
+    overwrite on access, so keys for one-time users/accounts linger forever ->
+    slow unbounded memory growth over weeks."""
+    interval = int(os.getenv('CACHE_SWEEP_INTERVAL', '300'))
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            now = time.monotonic()
+            with _cache_lock:
+                for cache in (_user_cache, _admin_cache, _logs_chat_cache):
+                    for k in [k for k, v in cache.items() if v[0] <= now]:
+                        cache.pop(k, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[CACHE] sweep error: {e}")
 
 
 def uupdate(flt, update, *args, **kwargs):
@@ -1449,6 +1472,15 @@ async def delete_account_and_related(account_id):
                 pass
             del auto_reply_clients[key]
 
+    # Evict cached logs-chat entries for this account so the cache doesn't retain
+    # dead keys after deletion.
+    try:
+        with _cache_lock:
+            for key in variants:
+                _logs_chat_cache.pop(str(key), None)
+    except Exception:
+        pass
+
 async def safe_leave_chat(client, target):
     """Best-effort leave for channels/supergroups and basic groups.
 
@@ -2007,7 +2039,7 @@ async def run_forwarding_loop(user_id, account_id):
     client = None
     
     try:
-        acc = accounts_col.find_one({'_id': account_id})
+        acc = await db_call(accounts_col.find_one, {'_id': account_id})
         if not acc:
             print(f"[FORWARDING] Account {account_id} not found")
             return
@@ -2019,7 +2051,7 @@ async def run_forwarding_loop(user_id, account_id):
         if not await client.is_user_authorized():
             print(f"[FORWARDING] Account {account_id} not authorized - disabling")
             try:
-                accounts_col.update_one(
+                await db_call(accounts_col.update_one,
                     {'_id': account_id},
                     {'$set': {'is_forwarding': False, 'auth_invalid': True}}
                 )
@@ -2039,10 +2071,10 @@ async def run_forwarding_loop(user_id, account_id):
         
         # Attach auto-reply handler to the SAME client (best practice)
         owner_id = acc.get('owner_id')
-        user = get_user(owner_id)
+        user = await db_call(get_user, owner_id)
         if user.get('autoreply_enabled', False):
             # Only use custom message - no default fallback
-            settings_doc = account_settings_col.find_one({'account_id': str(account_id)})
+            settings_doc = await db_call(account_settings_col.find_one, {'account_id': str(account_id)})
             
             reply_text = None
             if settings_doc and 'auto_reply' in settings_doc:
@@ -2086,6 +2118,10 @@ async def run_forwarding_loop(user_id, account_id):
         while True:
             try:
                 round_num += 1
+                # Bound the per-account entity cache so a huge-group account can't
+                # grow it without limit across rounds (memory safety at scale).
+                if len(entity_cache) > int(os.getenv('ENTITY_CACHE_MAX', '3000')):
+                    entity_cache.clear()
                 # Connection watchdog: if the link dropped (timeout/network), bring it
                 # back before doing work. auto_reconnect usually handles this; this is a
                 # belt-and-suspenders check that prevents "stuck disconnected" loops.
@@ -2114,8 +2150,8 @@ async def run_forwarding_loop(user_id, account_id):
                     if not napped:
                         break
                     continue
-                user = get_user_cached(user_id)
-                tier_settings = get_user_tier_settings(user_id)
+                user = await db_call(get_user_cached, user_id)
+                tier_settings = await db_call(get_user_tier_settings, user_id)
                 fwd_mode = user.get('forwarding_mode', 'topics')
                 
                 # Use user-level interval presets (including custom)
@@ -2203,7 +2239,7 @@ async def run_forwarding_loop(user_id, account_id):
                 # Round start log so user can confirm next round started
                 try:
                     # Get user settings for display
-                    user_doc = get_user_cached(user_id)
+                    user_doc = user  # reuse already-loaded user doc (avoids a per-round DB read)
                     
                     # Fix mode display to show user-friendly text
                     if fwd_mode == 'topics':
@@ -2241,7 +2277,11 @@ async def run_forwarding_loop(user_id, account_id):
                 failed_set = set()
                 flood_map = {}
                 pruned_set = set()
-                prune_on = _toxic_prune_enabled(user_id)
+                # Read per-round policy flags ONCE (off-loop) instead of on every
+                # send/failure — these hit cached settings/user find_ones otherwise.
+                prune_on = await db_call(_toxic_prune_enabled, user_id)
+                _live_logs = await db_call(live_logs_enabled)
+                auto_leave_on = await db_call(_is_auto_leave_enabled, user_id)
                 try:
                     def _load_round_state():
                         fset = {d.get('group_key') for d in account_failed_groups_col.find(
@@ -2281,7 +2321,7 @@ async def run_forwarding_loop(user_id, account_id):
                     print(f"[FORWARDING] Added {len(groups_to_forward)} topic groups")
                 
                 if fwd_mode in ('auto', 'both'):
-                    auto_limit = get_user_auto_group_limit(user_id)
+                    auto_limit = await db_call(get_user_auto_group_limit, user_id)
                     count = 0
                     auto_groups = await db_call(lambda: list(account_auto_groups_col.find(
                         {'account_id': {'$in': _account_id_variants(account_id)}}
@@ -2337,7 +2377,7 @@ async def run_forwarding_loop(user_id, account_id):
                 # so each round targets target_cycle/K to keep per-group freq = target.
                 n_groups = len(groups_to_forward)
                 est_round_send = n_groups * msg_delay  # seconds (approx; msg_delay dominates)
-                target_per_hour = get_effective_target_per_hour()
+                target_per_hour = await db_call(get_effective_target_per_hour)
                 target_cycle = (3600.0 / target_per_hour) / rotation_buckets
                 round_delay = max(TARGET_MIN_CYCLE_FLOOR, int(target_cycle - est_round_send))
                 full_pass = rotation_buckets * (est_round_send + round_delay)
@@ -2530,7 +2570,7 @@ async def run_forwarding_loop(user_id, account_id):
                         # of loop) instead of a DB write on every message.
                         # Live "sent to X" log is fire-and-forget + bounded so a slow
                         # or flood-limited logger bot never throttles forwarding.
-                        if live_logs_enabled() and sent_msg_id and current_entity:
+                        if _live_logs and sent_msg_id and current_entity:
                             view_link = build_message_link(current_entity, sent_msg_id, current_topic_id)
                             if view_link:
                                 _ad_no = (i % len(ads)) + 1 if (ads_mode == 'saved' and ads) else 1
@@ -2562,12 +2602,12 @@ async def run_forwarding_loop(user_id, account_id):
                                 await notify_toxic_pruned(account_id, acc.get('phone'), group['title'], _treason)
 
                         # Auto-leave the group if sending fails (only if enabled)
-                        if _is_auto_leave_enabled(user_id):
+                        if auto_leave_on:
                             try:
                                 if current_entity is not None:
                                     left_ok = await safe_leave_chat(client, current_entity)
                                     if left_ok:
-                                        remove_group_from_db(acc_id_str, group.get('type'), group_key, group)
+                                        await db_call(remove_group_from_db, acc_id_str, group.get('type'), group_key, group)
                                         await notify_auto_left(account_id, acc.get('phone'), group.get('title'), group_key, reason=type(e).__name__)
                                     await add_user_log(user_id, f"Auto-left {group['title'][:20]} after failure")
                             except Exception as le:
@@ -2618,12 +2658,12 @@ async def run_forwarding_loop(user_id, account_id):
                             print(f"[FORWARDING] Error {group['title']}: {error_str[:50]}")
 
                             # Auto-leave on any non-flood send failure (only if enabled)
-                            if _is_auto_leave_enabled(user_id):
+                            if auto_leave_on:
                                 try:
                                     if current_entity is not None:
                                         left_ok = await safe_leave_chat(client, current_entity)
                                         if left_ok:
-                                            remove_group_from_db(acc_id_str, group.get('type'), group_key, group)
+                                            await db_call(remove_group_from_db, acc_id_str, group.get('type'), group_key, group)
                                             await notify_auto_left(account_id, acc.get('phone'), group.get('title'), group_key, reason=error_str[:120])
                                         await add_user_log(user_id, f"Auto-left {group['title'][:20]} after failure")
                                 except Exception as le:
@@ -5136,7 +5176,7 @@ async def callback(event):
                 "<b>Broadcast Menu</b>\n\n"
                 "Choose an action."
             )
-            await event.edit(text, parse_mode='html', buttons=broadcast_menu_keyboard(uid))
+            await event.edit(text, parse_mode='html', buttons=await db_call(broadcast_menu_keyboard, uid))
             return
         
         if data == "menu_account":
@@ -5144,26 +5184,26 @@ async def callback(event):
             if uid in user_states:
                 del user_states[uid]
             
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             max_acc = get_user_max_accounts(uid)
             text = (
                 f"<b>📱 Account Management</b>\n\n"
                 f"<b>Accounts:</b> <code>{len(accounts)}/{max_acc}</code>\n\n"
                 f"<i>Select an account below or add a new one.</i>"
             )
-            await event.edit(text, parse_mode='html', buttons=account_list_keyboard(uid))
+            await event.edit(text, parse_mode='html', buttons=await db_call(account_list_keyboard, uid))
             return
         
         if data.startswith("accpage_"):
             page = int(data.split("_")[1])
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             max_acc = get_user_max_accounts(uid)
             text = (
                 f"<b>👤 Account Management</b>\n\n"
                 f"<b>Accounts:</b> <code>{len(accounts)}/{max_acc}</code>\n\n"
                 f"<i>Page:</i> <code>{page+1}</code>"
             )
-            await event.edit(text, parse_mode='html', buttons=account_list_keyboard(uid, page))
+            await event.edit(text, parse_mode='html', buttons=await db_call(account_list_keyboard, uid, page))
             return
         
         if data == "add_account":
@@ -5181,20 +5221,24 @@ async def callback(event):
             return
         
         if data == "delete_account_menu":
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             if not accounts:
                 await event.answer("No accounts to delete!", alert=True)
                 return
-            await event.edit("**Delete Account**\n\nSelect account to delete:", buttons=delete_account_list_keyboard(uid))
+            await event.edit("**Delete Account**\n\nSelect account to delete:", buttons=await db_call(delete_account_list_keyboard, uid))
             return
         
         if data.startswith("confirm_del_"):
             acc_id = data.replace("confirm_del_", "")
             from bson.objectid import ObjectId
+            # NOTE: accounts are keyed by 'owner_id' (not 'user_id'). The old query
+            # used 'user_id' and always matched nothing -> deletion silently failed.
             try:
-                acc = accounts_col.find_one({'_id': ObjectId(acc_id), 'user_id': uid})
-            except:
-                acc = accounts_col.find_one({'_id': acc_id, 'user_id': uid})
+                acc = await db_call(accounts_col.find_one, {'_id': ObjectId(acc_id), 'owner_id': uid})
+            except Exception:
+                acc = None
+            if not acc:
+                acc = await db_call(accounts_col.find_one, {'_id': acc_id, 'owner_id': uid})
             if acc:
                 phone = acc['phone']
                 await event.edit(
@@ -5203,29 +5247,30 @@ async def callback(event):
                         [Button.inline("Yes, Delete", f"final_del_{acc_id}"), Button.inline("No, Cancel", b"delete_account_menu")]
                     ]
                 )
+            else:
+                await event.answer("Account not found!", alert=True)
             return
         
         if data.startswith("final_del_"):
             acc_id = data.replace("final_del_", "")
             from bson.objectid import ObjectId
             try:
-                acc = accounts_col.find_one({'_id': ObjectId(acc_id), 'user_id': uid})
-            except:
-                acc = accounts_col.find_one({'_id': acc_id, 'user_id': uid})
+                acc = await db_call(accounts_col.find_one, {'_id': ObjectId(acc_id), 'owner_id': uid})
+            except Exception:
+                acc = None
+            if not acc:
+                acc = await db_call(accounts_col.find_one, {'_id': acc_id, 'owner_id': uid})
             if acc:
-                real_id = acc['_id']
-                if real_id in forwarding_tasks:
-                    forwarding_tasks[real_id].cancel()
-                    del forwarding_tasks[real_id]
-                accounts_col.delete_one({'_id': real_id})
-                account_topics_col.delete_many({'account_id': real_id})
-                account_settings_col.delete_many({'account_id': real_id})
-                account_auto_groups_col.delete_many({'account_id': real_id})
+                # Full cleanup: cancels the forwarding task, disconnects the auto-reply
+                # client, and removes every related collection (no orphaned data).
+                await delete_account_and_related(acc['_id'])
                 await event.answer("Account deleted!", alert=True)
+            else:
+                await event.answer("Account not found!", alert=True)
             await event.edit(
                 "<b>👤 Account Management</b>",
                 parse_mode='html',
-                buttons=account_list_keyboard(uid)
+                buttons=await db_call(account_list_keyboard, uid)
             )
             return
         
@@ -6011,14 +6056,14 @@ async def callback(event):
                 enabled_by_user = user.get('autoreply_enabled', False)  # Change default to False
                 
                 # Also check if user has actually set an auto-reply message
-                user_accounts = get_user_accounts(uid)
-                has_auto_reply_message = False
-                if user_accounts:
-                    for acc in user_accounts:
-                        settings = get_account_settings(str(acc.get('_id')))
-                        if settings.get('auto_reply'):
-                            has_auto_reply_message = True
-                            break
+                # Do the N accounts + per-account settings lookups in ONE off-loop hop.
+                def _has_autoreply_msg():
+                    for acc in get_user_accounts(uid):
+                        s = get_account_settings(str(acc.get('_id')))
+                        if s.get('auto_reply'):
+                            return True
+                    return False
+                has_auto_reply_message = await db_call(_has_autoreply_msg)
                 
                 # Show ON only if enabled AND has message
                 auto_reply_status = "✅ ON" if (enabled_by_user and has_auto_reply_message) else "❌ OFF"
@@ -6238,7 +6283,7 @@ async def callback(event):
                 text += "🔒 <b>Auto-reply is a premium feature.</b>\n\n"
                 text += "Upgrade to premium to set custom auto-reply messages!"
             
-            await event.edit(text, parse_mode='html', buttons=autoreply_menu_keyboard(uid))
+            await event.edit(text, parse_mode='html', buttons=await db_call(autoreply_menu_keyboard, uid))
             return
         
         if data == "autoreply_view":
@@ -6292,7 +6337,7 @@ async def callback(event):
             
             text += f"<b>Status:</b> <code>{'ON' if enabled else 'OFF'}</code>\n"
             text += f"<b>Custom Reply:</b> {'✅' if has_custom else '❌'} <code>{'Set' if has_custom else 'Not Set'}</code>"
-            await event.edit(text, parse_mode='html', buttons=autoreply_menu_keyboard(uid))
+            await event.edit(text, parse_mode='html', buttons=await db_call(autoreply_menu_keyboard, uid))
             return
         
         if data == "autoreply_custom":
@@ -7816,7 +7861,7 @@ async def callback(event):
         
         if data.startswith("acc_"):
             account_id = data.split("_")[1]
-            acc = get_account_by_id(account_id)
+            acc = await db_call(get_account_by_id, account_id)
             if not acc:
                 await event.answer("Not found!", alert=True)
                 return
@@ -7835,10 +7880,15 @@ async def callback(event):
                 )
                 return
             
-            stats = get_account_stats(account_id)
-            settings = get_account_settings(account_id)
-            topics = account_topics_col.count_documents({'account_id': account_id})
-            groups = account_auto_groups_col.count_documents({'account_id': account_id})
+            # Batch the 4 panel reads into ONE off-loop hop (was 4 blocking calls/tap).
+            def _acc_panel_data():
+                return (
+                    get_account_stats(account_id),
+                    get_account_settings(account_id),
+                    account_topics_col.count_documents({'account_id': account_id}),
+                    account_auto_groups_col.count_documents({'account_id': account_id}),
+                )
+            stats, settings, topics, groups = await db_call(_acc_panel_data)
             
             status = "🟢 Running" if acc.get('is_forwarding') else "🔴 Stopped"
             
@@ -10694,6 +10744,11 @@ async def main():
             _t = asyncio.create_task(_coro)
             _BG_TASKS.add(_t)
             _t.add_done_callback(_BG_TASKS.discard)
+
+    # TTL-cache sweeper runs in EVERY process (UI + workers) to bound memory.
+    _cst = asyncio.create_task(cache_sweeper())
+    _BG_TASKS.add(_cst)
+    _cst.add_done_callback(_BG_TASKS.discard)
 
     print("="*50)
     print("Bot running!")
