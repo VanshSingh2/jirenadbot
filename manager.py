@@ -143,6 +143,8 @@ else:
     _mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
 _db = _mongo[DB_NAME]
 _accounts = _db['accounts']
+_settings = _db['bot_settings']       # live admin overrides written by the bot's ops-manager
+_status = _db['manager_status']       # this node publishes its state here for /health + AI manager
 _health = _db['worker_health']
 
 # {worker_id: Popen}, plus the UI bot under key 'bot'
@@ -158,7 +160,20 @@ _last_proxy_alert = 0.0
 _last_proxy_alert_needed = 0
 _advice_state = {}   # topic -> {'last': ts, 'metric': float} for de-duping capacity DMs
 _cpu_hot = 0         # consecutive high-CPU cycles
+_applied_overrides = {}   # last RAW bot_settings values we acted on (prevents re-trigger loops)
+_worker_fail_counts = {}  # worker_id -> consecutive crash count (for crash alerts)
 _stop = False
+
+
+def _ovr_int(v):
+    """Coerce a settings override to int; reject bools and non-integral floats."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    return None
 
 
 def _proxy_count():
@@ -232,6 +247,7 @@ def _set_worker_count(n):
     for k in [k for k in _procs if k != 'bot']:
         _stop_proc(_procs.pop(k))
     # Start n fresh workers.
+    _worker_fail_counts.clear()   # fresh pool -> reset crash counters
     for i in range(n):
         _procs[i] = _spawn('worker', worker_id=i, worker_count=n)
     _running_worker_count = n
@@ -261,12 +277,20 @@ def _respawn_dead_workers():
     for i in list(k for k in _procs if k != 'bot'):
         p = _procs.get(i)
         if p is not None and p.poll() is not None:
-            print(f"[MANAGER] Worker {i} died (exit {p.returncode}); respawning")
+            _worker_fail_counts[i] = _worker_fail_counts.get(i, 0) + 1
+            n = _worker_fail_counts[i]
+            print(f"[MANAGER] Worker {i} died (exit {p.returncode}); respawning (crash #{n})")
+            # A worker that keeps dying is usually a config/DB/auth problem that a
+            # respawn won't fix — surface it instead of silently looping forever.
+            if n in (3, 10, 30, 100):
+                alert_admin(f"⚠️ Jiren Ads Bot — worker {i} has crashed {n}× in a row. "
+                            "Check the logs (bad env, DB unreachable, or a code error).")
             _procs[i] = _spawn('worker', worker_id=i, worker_count=_running_worker_count)
 
 
 def _desired_workers(active):
-    raw = math.ceil(active / _effective_cap) if active > 0 else MIN_WORKERS
+    cap = max(1, _effective_cap)   # guard against a 0 cap (div-by-zero)
+    raw = math.ceil(active / cap) if active > 0 else MIN_WORKERS
     return max(MIN_WORKERS, min(MAX_WORKERS, raw))
 
 
@@ -495,6 +519,114 @@ def _capacity_advisor(owned):
         _cpu_hot = 0
 
 
+def _read_overrides():
+    try:
+        return _settings.find_one({'_id': 'global'}) or {}
+    except Exception as e:
+        print(f"[MANAGER] settings read failed: {e}")
+        return {}
+
+
+def _apply_overrides():
+    """Apply live admin overrides (written by the bot's ops-manager into
+    bot_settings) so caps/worker-bounds can change WITHOUT a restart.
+
+    We key decisions off the RAW settings value we last acted on (not the
+    post-clamp in-memory globals). That way clamping a value (e.g. min>max)
+    never makes us re-apply-and-restart every cycle. Returns True if a change
+    requires re-scaling the worker pool."""
+    global MAX_ACCOUNTS_PER_WORKER, PER_IP_CAP, MIN_WORKERS, MAX_WORKERS
+    global _effective_cap, _last_cap_change, _stress_count, _healthy_count
+    doc = _read_overrides()
+    rescale = False
+    changes = []
+
+    # --- per-worker cap (admin range 5..500, decoupled from the auto-cap bounds) ---
+    raw = doc.get('ops_max_accounts_per_worker')
+    if raw != _applied_overrides.get('ops_max_accounts_per_worker'):
+        _applied_overrides['ops_max_accounts_per_worker'] = raw
+        v = _ovr_int(raw)
+        if v is not None:
+            v = max(5, min(500, v))
+            if v != MAX_ACCOUNTS_PER_WORKER:
+                MAX_ACCOUNTS_PER_WORKER = v
+                _effective_cap = v
+                # Stop health-adaptive from immediately undoing the admin's choice.
+                _last_cap_change = time.time()
+                _stress_count = 0
+                _healthy_count = 0
+                rescale = True
+                changes.append(f"{v}/worker")
+
+    # --- per-IP cap ---
+    raw = doc.get('ops_per_ip_cap')
+    if raw != _applied_overrides.get('ops_per_ip_cap'):
+        _applied_overrides['ops_per_ip_cap'] = raw
+        v = _ovr_int(raw)
+        if v is not None:
+            v = max(1, min(500, v))
+            if v != PER_IP_CAP:
+                PER_IP_CAP = v
+                changes.append(f"{v}/IP")
+
+    # --- worker bounds (handled together so min<=max clamping is coherent) ---
+    raw_min = doc.get('ops_min_workers')
+    raw_max = doc.get('ops_max_workers')
+    if (raw_min != _applied_overrides.get('ops_min_workers')
+            or raw_max != _applied_overrides.get('ops_max_workers')):
+        _applied_overrides['ops_min_workers'] = raw_min
+        _applied_overrides['ops_max_workers'] = raw_max
+        vmin = _ovr_int(raw_min)
+        vmax = _ovr_int(raw_max)
+        new_min = max(1, min(256, vmin)) if vmin is not None else MIN_WORKERS
+        new_max = max(1, min(256, vmax)) if vmax is not None else MAX_WORKERS
+        if new_min > new_max:
+            new_min = new_max
+        if new_min != MIN_WORKERS or new_max != MAX_WORKERS:
+            MIN_WORKERS, MAX_WORKERS = new_min, new_max
+            rescale = True
+            changes.append(f"workers {MIN_WORKERS}-{MAX_WORKERS}")
+
+    if changes:
+        print(f"[MANAGER] Applied live overrides: {', '.join(changes)}")
+        alert_admin("⚙️ Applied your settings: "
+                    f"{MAX_ACCOUNTS_PER_WORKER}/worker, {PER_IP_CAP}/IP, "
+                    f"workers {MIN_WORKERS}-{MAX_WORKERS}. Re-scaling now.")
+    return rescale
+
+
+def _write_status(active, total, desired):
+    """Publish this node's live state so the bot's /health and AI ops-manager can
+    read real numbers (workers running, cap, CPU/RAM, proxies)."""
+    try:
+        cpu, total_mb = _machine_info()
+        _status.update_one(
+            {'_id': f"node:{NODE_ID}"},
+            {'$set': {
+                'node_id': NODE_ID,
+                'node_count': NODE_COUNT,
+                'run_ui': RUN_UI,
+                'effective_cap': _effective_cap,
+                'max_accounts_per_worker': MAX_ACCOUNTS_PER_WORKER,
+                'per_ip_cap': PER_IP_CAP,
+                'min_workers': MIN_WORKERS,
+                'max_workers': MAX_WORKERS,
+                'running_workers': _running_worker_count,
+                'desired_workers': desired,
+                'active_owned': active,
+                'fleet_total': total,
+                'proxies': _proxy_count(),
+                'cpu': cpu,
+                'ram_total_mb': round(total_mb),
+                'load5': round(_cpu_load_ratio(cpu) * cpu, 2),
+                'updated_at': datetime.now(),
+            }},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[MANAGER] status write failed: {e}")
+
+
 def _count_active():
     """Return (owned_by_this_node, fleet_total) active forwarding accounts.
     On a single node we use a cheap count; multi-node fetches ids to shard."""
@@ -515,9 +647,20 @@ def _handle_signal(signum, frame):
 
 
 def main():
-    global _down_counter
+    global _down_counter, MIN_WORKERS, MAX_WORKERS
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+
+    # Guard against a multi-VPS misconfig where NODE_ID is out of range — two
+    # nodes would then own the SAME accounts (double-sends -> bans).
+    if NODE_ID >= NODE_COUNT:
+        print(f"[MANAGER] FATAL: NODE_ID={NODE_ID} must be < NODE_COUNT={NODE_COUNT}. Refusing to start.")
+        alert_admin(f"❌ Manager misconfig: NODE_ID={NODE_ID} >= NODE_COUNT={NODE_COUNT}. "
+                    "This node was NOT started. Fix .env and restart.")
+        return
+    if MIN_WORKERS > MAX_WORKERS:
+        print(f"[MANAGER] MIN_WORKERS({MIN_WORKERS}) > MAX_WORKERS({MAX_WORKERS}); clamping min to max.")
+        MIN_WORKERS = MAX_WORKERS
 
     print("=" * 50)
     print("Jiren Ads Bot — Auto-Scaling Manager")
@@ -539,6 +682,9 @@ def main():
             _ensure_bot_alive()
             _respawn_dead_workers()
 
+            # Live admin overrides (per-worker cap, per-IP cap, worker bounds).
+            override_rescale = _apply_overrides()
+
             # active = accounts THIS node owns; total = whole fleet (for context).
             active, total = _safe_count()
 
@@ -547,10 +693,13 @@ def main():
 
             desired = _desired_workers(active)
 
-            if cap_changed:
-                # Cap changed -> restart pool so workers pick up the new cap (and
-                # the worker count that matches it).
-                print(f"[MANAGER] Re-scaling for new cap={_effective_cap} -> {desired} workers")
+            # Publish this node's state for /health + the AI ops-manager.
+            _write_status(active, total, desired)
+
+            if cap_changed or override_rescale:
+                # Cap/bounds changed -> restart pool so workers pick up the new cap
+                # (and the worker count that matches it).
+                print(f"[MANAGER] Re-scaling for cap={_effective_cap} -> {desired} workers")
                 _set_worker_count(desired)
                 _down_counter = 0
             elif desired > _running_worker_count:

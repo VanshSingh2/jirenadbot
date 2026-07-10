@@ -505,6 +505,7 @@ user_states = {}
 forwarding_tasks = {}
 auto_reply_clients = {}
 last_replied = {}
+_BG_TASKS = set()   # strong refs for long-lived background tasks (prevent GC)
 
 # Auto group-join cancellation flags (uid -> bool)
 auto_join_cancel = {}
@@ -1550,7 +1551,9 @@ async def _interruptible_round_sleep(total_seconds, account_id, check_interval=1
         step = min(int(check_interval), remaining)
         await asyncio.sleep(step)
         remaining -= step
-        acc = get_account_by_id(account_id)
+        # Offload the flag-poll to the DB thread pool: at 100-2000 accounts a sync
+        # find_one here (every check_interval, per account) stalls the event loop.
+        acc = await db_call(get_account_by_id, account_id)
         if not acc or not acc.get('is_forwarding', False):
             return False
     return True
@@ -1559,7 +1562,7 @@ async def _interruptible_round_sleep(total_seconds, account_id, check_interval=1
 async def _sleep_quiet_hours(wait_seconds: int, account_id):
     remaining = int(wait_seconds)
     while remaining > 0:
-        acc = get_account_by_id(account_id)
+        acc = await db_call(get_account_by_id, account_id)
         if not acc or not acc.get('is_forwarding'):
             return False
         step = min(60, remaining)
@@ -8309,6 +8312,18 @@ async def text_handler(event):
         await event.respond(f"✅ Global frequency set to {val}/hr per group.")
         return
 
+    # Ops manager: natural-language chat with the fleet manager (admin only).
+    if action == 'manager_chat':
+        if not is_admin(uid):
+            user_states.pop(uid, None)
+            return
+        if text.lower() in ('exit', 'quit', 'done', 'stop', 'bye', 'leave'):
+            user_states.pop(uid, None)
+            await event.respond("👋 Left manager chat. Send /manager anytime.")
+            return
+        await _handle_manager_message(event, uid, text, state)
+        return
+
     # ===================== Payment Screenshot Handler =====================
     if state_type == 'awaiting_payment_screenshot':
         # User should send a photo (payment screenshot)
@@ -10165,6 +10180,438 @@ def _loop_exception_handler(loop, context):
         pass
 
 
+# ============================================================================
+# OPS MANAGER: /health + a responsive, human-like fleet manager you can chat with
+# ----------------------------------------------------------------------------
+# manager.py publishes per-node state to `manager_status`; workers publish to
+# `worker_health`. This section reads those for /health and powers a natural-
+# language chat (/manager) that can also CHANGE runtime settings (per-worker cap,
+# per-IP cap, worker bounds, frequency) by writing override keys into bot_settings
+# — which manager.py picks up within ~1 minute. Set AI_API_KEY in .env for free-
+# form chat; without it, a rule-based fallback still answers status and applies
+# explicit commands.
+# ============================================================================
+import json as _ops_json
+
+manager_status_col = db['manager_status']
+
+# action name -> (min, max, bot_settings key, human label)
+OPS_ACTIONS = {
+    'set_per_worker_cap': (5, 500, 'ops_max_accounts_per_worker', 'accounts per worker'),
+    'set_per_ip_cap':     (1, 500, 'ops_per_ip_cap',              'accounts per proxy/IP'),
+    'set_min_workers':    (1, 256, 'ops_min_workers',             'minimum workers'),
+    'set_max_workers':    (1, 256, 'ops_max_workers',             'maximum workers'),
+    'set_frequency':      (1, None, 'target_per_hour',            'send frequency (per hour per group)'),
+}
+
+
+def _ops_machine_stats():
+    """Local machine stats for the process running this (node 0 / UI box)."""
+    stats = {'cpu': os.cpu_count() or 1, 'load5': None, 'ram_total_gb': None,
+             'ram_used_pct': None, 'cpu_pct': None}
+    try:
+        stats['load5'] = round(os.getloadavg()[1], 2)
+    except Exception:
+        pass
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        stats['ram_total_gb'] = round(vm.total / (1024 ** 3), 1)
+        stats['ram_used_pct'] = vm.percent
+        stats['cpu_pct'] = psutil.cpu_percent(interval=0.0)
+    except Exception:
+        pass
+    return stats
+
+
+def build_ops_snapshot():
+    """Gather a live operations snapshot from Mongo (blocking; call via db_call)."""
+    from datetime import timedelta
+    now = datetime.now()
+    cutoff = now - timedelta(seconds=int(os.getenv('OPS_STALE_SECONDS', '150')))
+    workers, nodes = [], []
+    try:
+        workers = list(worker_health_col.find({'updated_at': {'$gte': cutoff}}))
+    except Exception:
+        pass
+    try:
+        nodes = list(manager_status_col.find({'updated_at': {'$gte': cutoff}}))
+    except Exception:
+        pass
+    try:
+        total_accounts = accounts_col.count_documents({})
+    except Exception:
+        total_accounts = 0
+    try:
+        active_accounts = accounts_col.count_documents({'is_forwarding': True})
+    except Exception:
+        active_accounts = 0
+    try:
+        total_users = users_col.count_documents({})
+    except Exception:
+        total_users = 0
+    agg = {'sends': 0, 'fails': 0, 'floods': 0, 'peerfloods': 0, 'timeouts': 0, 'running': 0}
+    for w in workers:
+        for k in ('sends', 'fails', 'floods', 'peerfloods', 'timeouts'):
+            agg[k] += int(w.get(k, 0) or 0)
+        agg['running'] += int(w.get('active_accounts', 0) or 0)
+    try:
+        settings = settings_col.find_one({'_id': 'global'}) or {}
+    except Exception:
+        settings = {}
+    return {
+        'ts': now, 'total_accounts': total_accounts, 'active_accounts': active_accounts,
+        'total_users': total_users, 'workers': workers, 'nodes': nodes, 'agg': agg,
+        'settings': settings, 'machine': _ops_machine_stats(),
+        'freq': get_effective_target_per_hour(),
+    }
+
+
+def _ops_overrides_text(st):
+    ov = []
+    if st.get('ops_max_accounts_per_worker'):
+        ov.append(f"per-worker cap {st['ops_max_accounts_per_worker']}")
+    if st.get('ops_per_ip_cap'):
+        ov.append(f"per-IP cap {st['ops_per_ip_cap']}")
+    if st.get('ops_min_workers') or st.get('ops_max_workers'):
+        ov.append(f"workers {st.get('ops_min_workers', '?')}-{st.get('ops_max_workers', '?')}")
+    return ", ".join(ov) if ov else "none (manager defaults)"
+
+
+def format_health_report(snap):
+    agg, nodes, workers, st = snap['agg'], snap['nodes'], snap['workers'], snap['settings']
+    L = ["<b>🩺 Jiren Ads — Cluster Health</b>\n"]
+    L.append(f"<b>Fleet:</b> {snap['total_accounts']} accounts • "
+             f"{snap['active_accounts']} set to forward • {snap['total_users']} users")
+    L.append(f"<b>Running now:</b> {agg['running']} accounts on {len(workers)} worker(s) "
+             f"across {len(nodes)} node(s)")
+    if nodes:
+        L.append("\n<b>Nodes</b>")
+        for n in sorted(nodes, key=lambda d: d.get('node_id', 0)):
+            ram_gb = (n.get('ram_total_mb', 0) or 0) / 1024
+            L.append(
+                f"• node {n.get('node_id', 0) + 1}/{n.get('node_count', 1)}: "
+                f"{n.get('running_workers', '?')} workers @ {n.get('effective_cap', '?')}/worker • "
+                f"{n.get('active_owned', '?')} active • {n.get('cpu', '?')} vCPU • "
+                f"{ram_gb:.1f}GB • load {n.get('load5', '?')} • {n.get('proxies', 0)} proxies")
+    else:
+        L.append("\n<i>No node status yet. If you run plain <code>python bot.py</code> "
+                 "(all-in-one) the manager isn't publishing status — run <code>python manager.py</code> "
+                 "for auto-scaling + live node stats.</i>")
+    ops = agg['sends'] + agg['fails']
+    L.append(f"\n<b>Last window:</b> {agg['sends']} sends • {agg['fails']} fails • "
+             f"{agg['floods'] + agg['peerfloods']} floods • {agg['timeouts']} timeouts")
+    if ops:
+        L.append(f"  → error {agg['fails'] / ops * 100:.0f}% • "
+                 f"flood {(agg['floods'] + agg['peerfloods']) / max(1, agg['sends']) * 100:.0f}%")
+    m = snap['machine']
+    if m.get('ram_total_gb'):
+        L.append(f"\n<b>This box:</b> {m['cpu']} vCPU • {m['ram_total_gb']}GB "
+                 f"({m.get('ram_used_pct', '?')}% used) • load {m.get('load5', '?')}")
+    L.append(f"\n<b>Controls:</b> frequency {snap['freq']}/hr per group")
+    L.append(f"  overrides: {_ops_overrides_text(st)}")
+    L.append("\n<i>💬 Talk to the manager: /manager</i>")
+    return "\n".join(L)
+
+
+def _ops_plain_status(snap):
+    """Compact plain-text status (for AI context + rule-based replies)."""
+    agg, nodes = snap['agg'], snap['nodes']
+    lines = [
+        f"accounts_total={snap['total_accounts']} forwarding={snap['active_accounts']} "
+        f"running_now={agg['running']} users={snap['total_users']}",
+        f"workers_online={len(snap['workers'])} nodes_online={len(nodes)} freq_per_hr={snap['freq']}",
+        f"last_window: sends={agg['sends']} fails={agg['fails']} "
+        f"floods={agg['floods'] + agg['peerfloods']} timeouts={agg['timeouts']}",
+    ]
+    for n in sorted(nodes, key=lambda d: d.get('node_id', 0)):
+        lines.append(
+            f"node{n.get('node_id', 0)}: workers={n.get('running_workers')}/{n.get('max_workers')} "
+            f"cap={n.get('effective_cap')}/worker per_ip_cap={n.get('per_ip_cap')} "
+            f"active={n.get('active_owned')} cpu={n.get('cpu')} ram_gb={round((n.get('ram_total_mb', 0) or 0) / 1024, 1)} "
+            f"load5={n.get('load5')} proxies={n.get('proxies')}")
+    lines.append("overrides: " + _ops_overrides_text(snap['settings']))
+    return "\n".join(lines)
+
+
+def apply_ops_action(action):
+    """Apply one action dict -> writes an override key into bot_settings.
+    Returns (ok: bool, human_message: str). manager.py picks it up within ~1 min."""
+    try:
+        name = str(action.get('action') or '').strip()
+        if name not in OPS_ACTIONS:
+            return False, f"unknown action '{name}'"
+        lo, hi, key, label = OPS_ACTIONS[name]
+        if name == 'set_frequency':
+            hi = HARD_MAX_TARGET_PER_HOUR
+        val = int(action.get('value'))
+        clamped = max(lo, min(hi, val)) if hi is not None else max(lo, val)
+        set_global_setting(key, clamped)
+        extra = f" (clamped from {val})" if clamped != val else ""
+        return True, f"{label} → {clamped}{extra}"
+    except Exception as e:
+        return False, f"could not apply {action}: {e}"
+
+
+def parse_ops_actions(text):
+    """Extract ```action {json}``` blocks from an AI reply."""
+    out = []
+    for mm in re.finditer(r'```action\s*(\{.*?\})\s*```', text or '', re.DOTALL):
+        try:
+            out.append(_ops_json.loads(mm.group(1)))
+        except Exception:
+            pass
+    return out
+
+
+def _ops_intent(text):
+    """Rule-based intent detection (used when no AI key, or as a safety net)."""
+    t = (text or '').lower()
+
+    def grab(patterns):
+        for p in patterns:
+            mm = re.search(p, t)
+            if mm:
+                for g in mm.groups():
+                    if g and g.isdigit():
+                        return int(g)
+        return None
+
+    if 'max' in t and 'worker' in t:
+        n = grab([r'max[\s-]*workers?[^\d]{0,15}(\d+)', r'(\d+)[^\d]{0,15}max[\s-]*workers?'])
+        if n is not None:
+            return {'action': 'set_max_workers', 'value': n}
+    if 'min' in t and 'worker' in t:
+        n = grab([r'min[\s-]*workers?[^\d]{0,15}(\d+)', r'(\d+)[^\d]{0,15}min[\s-]*workers?'])
+        if n is not None:
+            return {'action': 'set_min_workers', 'value': n}
+    if 'worker' in t and 'per' in t:
+        n = grab([r'per[\s-]*worker[^\d]{0,15}(\d+)', r'(\d+)[^\d]{0,15}per[\s-]*worker',
+                  r'accounts?\s*per\s*worker[^\d]{0,15}(\d+)'])
+        if n is not None:
+            return {'action': 'set_per_worker_cap', 'value': n}
+    if ('proxy' in t or 'proxies' in t or ' ip' in t or t.startswith('ip')) and 'per' in t:
+        n = grab([r'per[\s-]*(?:proxy|proxies|ip)[^\d]{0,15}(\d+)',
+                  r'(\d+)[^\d]{0,15}per[\s-]*(?:proxy|proxies|ip)'])
+        if n is not None:
+            return {'action': 'set_per_ip_cap', 'value': n}
+    if 'freq' in t or 'hour' in t or '/hr' in t or 'per hr' in t:
+        n = grab([r'freq\w*[^\d]{0,15}(\d+)', r'(\d+)\s*(?:/|per)\s*(?:hr|hour)'])
+        if n is not None:
+            return {'action': 'set_frequency', 'value': n}
+    return None
+
+
+def _ops_rule_based_answer(text, snap):
+    t = (text or '').lower()
+    tips = []
+    if 'worker' in t and any(w in t for w in ('add', 'more', 'another', 'scale')):
+        tips.append("Workers auto-scale: the manager adds one whenever active accounts exceed the "
+                    "per-worker cap (up to max_workers). To force more workers now, LOWER the per-worker "
+                    "cap — e.g. say \u201cset per worker 40\u201d.")
+    if any(w in t for w in ('error', 'flood', 'ban', 'timeout', 'overload', 'too many')):
+        tips.append("If timeouts are high \u2192 lower per-worker cap (more, lighter workers). "
+                    "If FLOODs/bans are high \u2192 that's account-level: add proxies or lower frequency; "
+                    "more workers won't help.")
+    if any(w in t for w in ('proxy', 'proxies', 'ip')):
+        tips.append("Each IP safely holds ~40 accounts. Say \u201cset per proxy 30\u201d to be more conservative, "
+                    "or add IPs to PROXY_LIST.")
+    if not tips:
+        tips.append("Try: \u201cset per worker 40\u201d, \u201cset per proxy 30\u201d, \u201cset frequency 2\u201d, "
+                    "\u201cset max workers 24\u201d, or ask \u201chow are the workers doing?\u201d. "
+                    "Add AI_API_KEY in .env for full natural-language chat.")
+    return "<b>Here's the current picture:</b>\n<pre>" + _ops_plain_status(snap) + "</pre>\n" + "\n\n".join(tips)
+
+
+def _ops_system_prompt(snap):
+    hard = HARD_MAX_TARGET_PER_HOUR
+    return (
+        "You are the Ops Manager for 'Jiren Ads Bot', a Telegram ad-forwarding fleet running on one or "
+        "more VPS nodes. You talk to the OWNER like a sharp, friendly human SRE — concise, concrete, no fluff.\n\n"
+        "You can READ the live state below. When the owner clearly asks to CHANGE a setting, end your reply "
+        "with one or more action blocks in EXACTLY this format (one JSON per block):\n"
+        "```action\n{\"action\": \"set_per_worker_cap\", \"value\": 40}\n```\n"
+        "Valid actions (value ranges):\n"
+        "- set_per_worker_cap (5-500): accounts each worker process handles. Lower = more, lighter workers.\n"
+        "- set_per_ip_cap (1-500): accounts allowed per proxy/IP.\n"
+        "- set_min_workers (1-256) / set_max_workers (1-256): worker-count bounds.\n"
+        "- set_frequency (1-" + str(hard) + "): ad sends per hour per group.\n"
+        "Rules: Emit an action ONLY when the owner asks to change something (never for questions). "
+        "Briefly explain the change and its trade-off. Workers auto-scale — you rarely 'add a worker' directly; "
+        "lowering the per-worker cap spawns more workers, and the manager applies changes within ~1 minute. "
+        "If accounts are getting banned or flood-limited, the fix is more proxies or lower frequency, NOT more "
+        "workers. Never invent numbers that aren't in the live state.\n\n"
+        "LIVE STATE:\n" + _ops_plain_status(snap)
+    )
+
+
+def _ai_chat(system_prompt, history, user_msg):
+    """Provider-agnostic chat call. Returns text, None (no key), or '__AI_ERROR__:..'.
+    Blocking — call via asyncio.to_thread."""
+    key = (os.getenv('AI_API_KEY') or '').strip()
+    if not key:
+        return None
+    provider = (os.getenv('AI_PROVIDER') or 'openai').strip().lower()
+    model = (os.getenv('AI_MODEL') or '').strip()
+    base = (os.getenv('AI_BASE_URL') or '').strip()
+    timeout = int(os.getenv('AI_TIMEOUT', '45'))
+    try:
+        if provider == 'anthropic':
+            model = model or 'claude-3-5-haiku-latest'
+            msgs = [{'role': m['role'], 'content': m['content']} for m in history]
+            msgs.append({'role': 'user', 'content': user_msg})
+            r = requests.post(base or 'https://api.anthropic.com/v1/messages',
+                              headers={'x-api-key': key, 'anthropic-version': '2023-06-01',
+                                       'content-type': 'application/json'},
+                              json={'model': model, 'max_tokens': 1024, 'system': system_prompt,
+                                    'messages': msgs}, timeout=timeout)
+            r.raise_for_status()
+            return ''.join(b.get('text', '') for b in r.json().get('content', []) if b.get('type') == 'text')
+        if provider in ('gemini', 'google'):
+            model = model or 'gemini-1.5-flash'
+            contents = [{'role': 'user' if m['role'] == 'user' else 'model',
+                         'parts': [{'text': m['content']}]} for m in history]
+            contents.append({'role': 'user', 'parts': [{'text': user_msg}]})
+            url = (base or 'https://generativelanguage.googleapis.com/v1beta') + \
+                  f'/models/{model}:generateContent?key={key}'
+            r = requests.post(url, json={'system_instruction': {'parts': [{'text': system_prompt}]},
+                                         'contents': contents}, timeout=timeout)
+            r.raise_for_status()
+            return ''.join(p.get('text', '') for p in r.json()['candidates'][0]['content']['parts'])
+        # default: OpenAI-compatible (OpenAI, Groq, OpenRouter, Together, ... via AI_BASE_URL)
+        model = model or 'gpt-4o-mini'
+        msgs = [{'role': 'system', 'content': system_prompt}]
+        msgs += [{'role': m['role'], 'content': m['content']} for m in history]
+        msgs.append({'role': 'user', 'content': user_msg})
+        url = (base or 'https://api.openai.com/v1').rstrip('/') + '/chat/completions'
+        r = requests.post(url, headers={'Authorization': f'Bearer {key}', 'content-type': 'application/json'},
+                          json={'model': model, 'messages': msgs, 'temperature': 0.3, 'max_tokens': 1024},
+                          timeout=timeout)
+        r.raise_for_status()
+        return r.json()['choices'][0]['message']['content']
+    except Exception as e:
+        return f"__AI_ERROR__:{e}"
+
+
+async def _handle_manager_message(event, uid, text, state):
+    snap = await db_call(build_ops_snapshot)
+    history = state.get('history', []) if isinstance(state, dict) else []
+    reply = await asyncio.to_thread(_ai_chat, _ops_system_prompt(snap), history, text)
+    used_ai = reply is not None and not str(reply).startswith('__AI_ERROR__')
+
+    actions, display = [], ""
+    if used_ai:
+        actions = parse_ops_actions(reply)
+        display = re.sub(r'```action\s*\{.*?\}\s*```', '', reply, flags=re.DOTALL).strip()
+    else:
+        intent = _ops_intent(text)
+        if intent:
+            actions = [intent]
+        else:
+            display = _ops_rule_based_answer(text, snap)
+        if reply and str(reply).startswith('__AI_ERROR__'):
+            display = ("<i>(AI unavailable: " +
+                       str(reply).replace('__AI_ERROR__:', '').strip()[:120] + ")</i>\n\n" + display).strip()
+
+    applied = []
+    for a in actions:
+        ok, msg = apply_ops_action(a)
+        applied.append(("✅ " if ok else "⚠️ ") + msg)
+
+    parts = []
+    if display:
+        parts.append(display)
+    if applied:
+        parts.append("\n".join(applied) + "\n\n<i>Manager applies changes within ~1 min.</i>")
+    if not parts:
+        parts.append("Got it.")
+    out = "\n\n".join(parts)
+
+    history = history + [{'role': 'user', 'content': text},
+                         {'role': 'assistant', 'content': (reply if used_ai else out)}]
+    state['history'] = history[-16:]
+    user_states[uid] = state
+    try:
+        await event.respond(out[:4000], parse_mode='html')
+    except Exception:
+        await event.respond(re.sub(r'<[^>]+>', '', out)[:4000])
+
+
+@main_bot.on(events.NewMessage(pattern=r'^/health(?:@[\w_]+)?(?:\s|$)'))
+async def cmd_health(event):
+    if not is_admin(event.sender_id):
+        return
+    snap = await db_call(build_ops_snapshot)
+    await event.respond(format_health_report(snap), parse_mode='html')
+
+
+@main_bot.on(events.NewMessage(pattern=r'^/manager(?:@[\w_]+)?(?:\s+([\s\S]+))?$'))
+async def cmd_manager(event):
+    uid = event.sender_id
+    if not is_admin(uid):
+        return
+    inline = (event.pattern_match.group(1) or '').strip()
+    existing = user_states.get(uid)
+    state = existing if isinstance(existing, dict) and existing.get('action') == 'manager_chat' else None
+    if state is None:
+        state = {'action': 'manager_chat', 'history': []}
+        user_states[uid] = state
+        has_ai = bool((os.getenv('AI_API_KEY') or '').strip())
+        intro = (
+            "<b>🧑‍✈️ Ops Manager</b>\n\n"
+            "I'm watching your fleet. Ask me things like:\n"
+            "• \u201chow are the workers doing?\u201d\n"
+            "• \u201cwe have 50 accounts, can we add a worker if more come?\u201d\n"
+            "• \u201cone worker has too many accounts, reduce per-worker to 40\u201d\n"
+            "• \u201cset per proxy 30\u201d, \u201cset frequency 2\u201d, \u201cset max workers 24\u201d\n\n"
+            + ("<i>AI chat is ON.</i>" if has_ai else
+               "<i>AI key not set — I'll still answer status + apply explicit commands. "
+               "Add AI_API_KEY in .env for full natural chat.</i>")
+            + "\n\nSend /endmanager (or \u201cexit\u201d) to leave."
+        )
+        await event.respond(intro, parse_mode='html')
+    if inline:
+        await _handle_manager_message(event, uid, inline, user_states[uid])
+
+
+@main_bot.on(events.NewMessage(pattern=r'^/endmanager(?:@[\w_]+)?(?:\s|$)'))
+async def cmd_endmanager(event):
+    uid = event.sender_id
+    if not is_admin(uid):
+        return
+    if isinstance(user_states.get(uid), dict) and user_states[uid].get('action') == 'manager_chat':
+        user_states.pop(uid, None)
+    await event.respond("👋 Left manager chat. Send /manager anytime.")
+
+
+@main_bot.on(events.NewMessage(pattern=r'^/setcap(?:@[\w_]+)?\s+(\d+)$'))
+async def cmd_setcap(event):
+    if not is_admin(event.sender_id):
+        return
+    ok, msg = apply_ops_action({'action': 'set_per_worker_cap', 'value': int(event.pattern_match.group(1))})
+    await event.respond(("✅ " if ok else "⚠️ ") + msg + ("\n\n<i>Applied within ~1 min.</i>" if ok else ""),
+                        parse_mode='html')
+
+
+@main_bot.on(events.NewMessage(pattern=r'^/setproxycap(?:@[\w_]+)?\s+(\d+)$'))
+async def cmd_setproxycap(event):
+    if not is_admin(event.sender_id):
+        return
+    ok, msg = apply_ops_action({'action': 'set_per_ip_cap', 'value': int(event.pattern_match.group(1))})
+    await event.respond(("✅ " if ok else "⚠️ ") + msg + ("\n\n<i>Applied within ~1 min.</i>" if ok else ""),
+                        parse_mode='html')
+
+
+@main_bot.on(events.NewMessage(pattern=r'^/setworkers(?:@[\w_]+)?\s+(\d+)\s+(\d+)$'))
+async def cmd_setworkers(event):
+    if not is_admin(event.sender_id):
+        return
+    mn, mx = int(event.pattern_match.group(1)), int(event.pattern_match.group(2))
+    r1 = apply_ops_action({'action': 'set_min_workers', 'value': mn})
+    r2 = apply_ops_action({'action': 'set_max_workers', 'value': mx})
+    await event.respond(f"✅ {r1[1]}\n✅ {r2[1]}\n\n<i>Applied within ~1 min.</i>", parse_mode='html')
+
+
 async def main():
     print("\n" + "="*50)
     print("Starting Jiren Ads Bot...")
@@ -10213,6 +10660,8 @@ async def main():
                         BotCommand('start', 'Open main menu'),
                         BotCommand('startbroadcast', 'Start broadcast'),
                         BotCommand('stopbroadcast', 'Stop broadcast'),
+                        BotCommand('health', 'Cluster health (admin)'),
+                        BotCommand('manager', 'Chat with the ops manager (admin)'),
                     ]
                 ))
             except Exception as e:
@@ -10238,10 +10687,13 @@ async def main():
             print(f"Notification bot failed: {e}")
 
     # Forwarding processes run the reconciler (resumes/aligns their shard) + health.
+    # Keep STRONG references: asyncio only holds a weak ref to bare tasks, so a
+    # long-lived background loop could otherwise be garbage-collected mid-run.
     if do_forwarding:
-        asyncio.create_task(forwarding_reconciler())
-        asyncio.create_task(health_logger())
-        asyncio.create_task(health_reporter())
+        for _coro in (forwarding_reconciler(), health_logger(), health_reporter()):
+            _t = asyncio.create_task(_coro)
+            _BG_TASKS.add(_t)
+            _t.add_done_callback(_BG_TASKS.discard)
 
     print("="*50)
     print("Bot running!")
