@@ -2282,6 +2282,7 @@ async def run_forwarding_loop(user_id, account_id):
                 prune_on = await db_call(_toxic_prune_enabled, user_id)
                 _live_logs = await db_call(live_logs_enabled)
                 auto_leave_on = await db_call(_is_auto_leave_enabled, user_id)
+                warmup_off_global = await db_call(get_global_setting, 'warmup_disabled', False)
                 try:
                     def _load_round_state():
                         fset = {d.get('group_key') for d in account_failed_groups_col.find(
@@ -2350,7 +2351,8 @@ async def run_forwarding_loop(user_id, account_id):
                     continue
                 
                 # ---- Warmup: new accounts ramp up gradually (hard cap WARMUP_DAYS) ----
-                if WARMUP_ENABLED and acc.get('added_at'):
+                # Skipped if disabled globally (/nowarmup all) or per-account (/nowarmup).
+                if WARMUP_ENABLED and not warmup_off_global and not acc.get('skip_warmup') and acc.get('added_at'):
                     try:
                         age_days = (datetime.now() - acc['added_at']).total_seconds() / 86400.0
                     except Exception:
@@ -10662,6 +10664,54 @@ async def cmd_setworkers(event):
     await event.respond(f"✅ {r1[1]}\n✅ {r2[1]}\n\n<i>Applied within ~1 min.</i>", parse_mode='html')
 
 
+@main_bot.on(events.NewMessage(pattern=r'^/nowarmup(?:@[\w_]+)?(?:\s+(\w+))?$'))
+async def cmd_nowarmup(event):
+    """Remove the 2-day warmup ramp so accounts send to ALL their groups immediately.
+    - /nowarmup       -> your own accounts (any user)
+    - /nowarmup all   -> every account, current + future (admin only)"""
+    uid = event.sender_id
+    arg = (event.pattern_match.group(1) or '').strip().lower()
+    if arg == 'all':
+        if not is_admin(uid):
+            await event.respond("⚠️ Only admins can remove warmup for ALL accounts.\n"
+                                "Use <code>/nowarmup</code> (no argument) for your own.", parse_mode='html')
+            return
+        set_global_setting('warmup_disabled', True)
+        await event.respond("✅ Warmup <b>disabled globally</b> — every account (current + new) skips the "
+                            "ramp-up and sends to all its groups immediately.\n\n"
+                            "<i>Re-enable with</i> <code>/warmup all</code>.", parse_mode='html')
+        return
+    res = await db_call(accounts_col.update_many, {'owner_id': uid}, {'$set': {'skip_warmup': True}})
+    n = getattr(res, 'modified_count', 0)
+    if n == 0:
+        await event.respond("You have no accounts to change. (Add an account first.)")
+        return
+    await event.respond(f"✅ Warmup removed for your <b>{n}</b> account(s). They'll skip the 2-day ramp-up "
+                        "and send to all groups right away.\n\n"
+                        "<i>Re-enable with</i> <code>/warmup</code>.\n"
+                        "<i>⚠️ Fresh accounts are more likely to get flagged without warmup.</i>",
+                        parse_mode='html')
+
+
+@main_bot.on(events.NewMessage(pattern=r'^/warmup(?:@[\w_]+)?(?:\s+(\w+))?$'))
+async def cmd_warmup(event):
+    """Re-enable the warmup ramp. Mirror of /nowarmup."""
+    uid = event.sender_id
+    arg = (event.pattern_match.group(1) or '').strip().lower()
+    if arg == 'all':
+        if not is_admin(uid):
+            await event.respond("⚠️ Admins only. Use <code>/warmup</code> (no argument) for your own accounts.",
+                                parse_mode='html')
+            return
+        set_global_setting('warmup_disabled', False)
+        await event.respond("✅ Warmup <b>re-enabled globally</b> (new accounts ramp up gradually over "
+                            f"{WARMUP_DAYS:g} day(s)).", parse_mode='html')
+        return
+    res = await db_call(accounts_col.update_many, {'owner_id': uid}, {'$unset': {'skip_warmup': ''}})
+    n = getattr(res, 'modified_count', 0)
+    await event.respond(f"✅ Warmup re-enabled for your <b>{n}</b> account(s).", parse_mode='html')
+
+
 async def main():
     print("\n" + "="*50)
     print("Starting Jiren Ads Bot...")
@@ -10710,6 +10760,8 @@ async def main():
                         BotCommand('start', 'Open main menu'),
                         BotCommand('startbroadcast', 'Start broadcast'),
                         BotCommand('stopbroadcast', 'Stop broadcast'),
+                        BotCommand('nowarmup', 'Skip the 2-day warmup for your accounts'),
+                        BotCommand('warmup', 'Re-enable the warmup ramp'),
                         BotCommand('health', 'Cluster health (admin)'),
                         BotCommand('manager', 'Chat with the ops manager (admin)'),
                     ]
