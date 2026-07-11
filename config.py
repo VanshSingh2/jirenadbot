@@ -16,7 +16,7 @@ BOT_CONFIG = {
 }
 
 # ===================== PLAN TIERS =====================
-# Kai (₹149), Super (₹249), Ultra (₹349)
+# Kai (₹199), Super (₹299), Ultra (₹399)
 
 PLAN_SCOUT = {
     'name': 'Legacy',
@@ -37,8 +37,8 @@ PLAN_SCOUT = {
 
 PLAN_GROW = {
     'name': 'Kai',
-    'price': 149,
-    'price_display': '₹149',
+    'price': 199,
+    'price_display': '₹199',
     'tagline': 'Scale your reach with multiple accounts',
     'emoji': '📈',
     'max_accounts': 3,
@@ -54,8 +54,8 @@ PLAN_GROW = {
 
 PLAN_PRIME = {
     'name': 'Super',
-    'price': 249,
-    'price_display': '₹249',
+    'price': 299,
+    'price_display': '₹299',
     'tagline': 'Advanced automation for serious marketers',
     'emoji': '⭐',
     'max_accounts': 5,
@@ -71,8 +71,8 @@ PLAN_PRIME = {
 
 PLAN_DOMINION = {
     'name': 'Ultra',
-    'price': 349,
-    'price_display': '₹349',
+    'price': 399,
+    'price_display': '₹399',
     'tagline': 'Ultimate power for advertising domination',
     'emoji': '👑',
     'max_accounts': 5,

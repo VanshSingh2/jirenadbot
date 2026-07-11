@@ -4281,9 +4281,9 @@ async def cmd_upgrade(event):
     plan_msg = (
         "**Choose Your Plan**\n\n"
         "Pick what fits your scale. You can upgrade anytime.\n\n"
-        "• Kai — 3 accounts (₹149)\n"
-        "• Super — 5 accounts (₹249)\n"
-        "• Ultra — 5 accounts (₹349)"
+        "• Kai — 3 accounts (₹199)\n"
+        "• Super — 5 accounts (₹299)\n"
+        "• Ultra — 5 accounts (₹399)"
     )
     
     welcome_image = MESSAGES.get('welcome_image', '')
@@ -5132,9 +5132,9 @@ async def callback(event):
                 # User has accounts, show plan selection
                 plan_msg = (
                     "**Choose Your Plan to Continue**\n\n"
-                    "• Kai — 3 accounts (₹149)\n"
-                    "• Super — 5 accounts (₹249)\n"
-                    "• Ultra — 5 accounts (₹349)"
+                    "• Kai — 3 accounts (₹199)\n"
+                    "• Super — 5 accounts (₹299)\n"
+                    "• Ultra — 5 accounts (₹399)"
                 )
                 
                 welcome_image = MESSAGES.get('welcome_image', '')
@@ -6359,9 +6359,9 @@ async def callback(event):
             plan_msg = (
                 "**Choose Your Plan**\n\n"
                 "Pick what fits your scale. You can upgrade anytime.\n\n"
-                "• Kai — 3 accounts (₹149)\n"
-                "• Super — 5 accounts (₹249)\n"
-                "• Ultra — 5 accounts (₹349)"
+                "• Kai — 3 accounts (₹199)\n"
+                "• Super — 5 accounts (₹299)\n"
+                "• Ultra — 5 accounts (₹399)"
             )
             
             welcome_image = MESSAGES.get('welcome_image', '')
@@ -7875,8 +7875,8 @@ async def callback(event):
                     "🔒 **Per-Account Configuration**\n\n"
                     "This feature allows you to customize settings for each account individually.\n\n"
                     "Available in:\n"
-                    "• Super Plan (₹249)\n"
-                    "• Ultra Plan (₹349)\n\n"
+                    "• Super Plan (₹299)\n"
+                    "• Ultra Plan (₹399)\n\n"
                     "Use main dashboard settings to control all accounts together.",
                     buttons=[[Button.inline("⬆️ Upgrade Plan", b"go_premium")], [Button.inline("🏠 Dashboard", b"enter_dashboard")]]
                 )
@@ -9536,9 +9536,9 @@ async def text_handler(event):
                     f"Phone: {state['phone']}\n"
                     f"Groups found: {count}\n\n"
                     f"Choose a plan to continue:\n"
-                    f"• Kai — 3 accounts (₹149)\n"
-                    f"• Super — 5 accounts (₹249)\n"
-                    f"• Ultra — 5 accounts (₹349)"
+                    f"• Kai — 3 accounts (₹199)\n"
+                    f"• Super — 5 accounts (₹299)\n"
+                    f"• Ultra — 5 accounts (₹399)"
                 )
                 
                 welcome_image = MESSAGES.get('welcome_image', '')
@@ -9641,9 +9641,9 @@ async def text_handler(event):
                     f"Phone: {state['phone']}\n"
                     f"Groups found: {count}\n\n"
                     f"Choose a plan to continue:\n"
-                    f"• Kai — 3 accounts (₹149)\n"
-                    f"• Super — 5 accounts (₹249)\n"
-                    f"• Ultra — 5 accounts (₹349)"
+                    f"• Kai — 3 accounts (₹199)\n"
+                    f"• Super — 5 accounts (₹299)\n"
+                    f"• Ultra — 5 accounts (₹399)"
                 )
                 
                 welcome_image = MESSAGES.get('welcome_image', '')
@@ -9939,10 +9939,10 @@ async def grant_premium_to_user(target_id: int, plan_key: str, days: int, *, sou
     """Single source of truth for premium granting + user DM + channel log."""
     plan_key = plan_key.lower().strip()
     plan_map = {
-        'grow': {'max_accounts': 3, 'price': 149, 'name': 'Kai', 'image_key': 'grow'},
-        'prime': {'max_accounts': 5, 'price': 249, 'name': 'Super', 'image_key': 'prime'},
-        'domi': {'max_accounts': 5, 'price': 349, 'name': 'Ultra', 'image_key': 'dominion'},
-        'dominion': {'max_accounts': 5, 'price': 349, 'name': 'Ultra', 'image_key': 'dominion'},
+        'grow': {'max_accounts': 3, 'price': 199, 'name': 'Kai', 'image_key': 'grow'},
+        'prime': {'max_accounts': 5, 'price': 299, 'name': 'Super', 'image_key': 'prime'},
+        'domi': {'max_accounts': 5, 'price': 399, 'name': 'Ultra', 'image_key': 'dominion'},
+        'dominion': {'max_accounts': 5, 'price': 399, 'name': 'Ultra', 'image_key': 'dominion'},
     }
     if plan_key not in plan_map:
         raise ValueError(f"Invalid plan_key: {plan_key}")
@@ -10059,9 +10059,9 @@ async def handle_notification_actions(event):
         )
         
         buttons = [
-            [Button.inline("📈 Kai (₹149)", f"grantplan_grow_{target_user_id}")],
-            [Button.inline("⭐ Super (₹249)", f"grantplan_prime_{target_user_id}")],
-            [Button.inline("👑 Ultra (₹349)", f"grantplan_domi_{target_user_id}")],
+            [Button.inline("📈 Kai (₹199)", f"grantplan_grow_{target_user_id}")],
+            [Button.inline("⭐ Super (₹299)", f"grantplan_prime_{target_user_id}")],
+            [Button.inline("👑 Ultra (₹399)", f"grantplan_domi_{target_user_id}")],
             [Button.inline("← Cancel", b"notif_cancel")]
         ]
         
