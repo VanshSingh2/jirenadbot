@@ -884,19 +884,25 @@ def get_display_plan_name(user: dict) -> str:
     }.get(plan_key, "No Plan")
 
 def get_plan_max_accounts(user: dict) -> int:
+    # Admin-granted EXTRA slots on top of the plan cap (set via /addaccount).
+    # Read from the already-loaded user doc -> no extra DB call in hot paths.
+    try:
+        bonus = max(0, int((user or {}).get('bonus_accounts', 0) or 0))
+    except Exception:
+        bonus = 0
     if not user or user.get('tier') != 'premium':
-        return FREE_TIER['max_accounts']
+        return FREE_TIER['max_accounts'] + bonus
     plan_key = normalize_plan_key(user.get('plan') or user.get('plan_name'))
     if plan_key in PLANS:
-        return PLANS[plan_key]['max_accounts']
+        return PLANS[plan_key]['max_accounts'] + bonus
     old_max = user.get('max_accounts', PREMIUM_TIER['max_accounts'])
     if old_max >= 15:
-        return PLANS['dominion']['max_accounts']
+        return PLANS['dominion']['max_accounts'] + bonus
     if old_max >= 7:
-        return PLANS['prime']['max_accounts']
+        return PLANS['prime']['max_accounts'] + bonus
     if old_max >= 3:
-        return PLANS['grow']['max_accounts']
-    return PLANS['grow']['max_accounts']
+        return PLANS['grow']['max_accounts'] + bonus
+    return PLANS['grow']['max_accounts'] + bonus
 
 def is_approved(user_id):
     if is_admin(user_id):
@@ -11579,6 +11585,44 @@ async def cmd_addacc(event):
         f"Adding account for <code>{target_id}</code>.\n\nSend phone with country code:\n<code>+919876543210</code>",
         parse_mode='html'
     )
+
+
+@main_bot.on(events.NewMessage(pattern=r'^/addaccount(?:@[\w_]+)?\s+(@?\w+)\s+(-?\d+)$'))
+async def cmd_addaccount(event):
+    """Admin: increase (or decrease) a user's account LIMIT by N, on top of their
+    plan cap — works for any user/plan. e.g. `/addaccount 123456 1` gives +1 slot.
+    Stored as `bonus_accounts` and applied everywhere (UI, add-account check, DB)
+    immediately, with NO extra cost in the forwarding hot path."""
+    if not is_admin(event.sender_id):
+        return
+    raw_target = event.pattern_match.group(1)
+    delta = int(event.pattern_match.group(2))
+    target_id = await resolve_target_user_id(raw_target, event.client)
+    if not target_id:
+        await event.respond("❌ User not found. Use a numeric id or @username they've used with the bot.")
+        return
+
+    def _read_bonus():
+        u = users_col.find_one({'user_id': int(target_id)}, {'bonus_accounts': 1}) or {}
+        return int(u.get('bonus_accounts', 0) or 0)
+    cur = await db_call(_read_bonus)
+    new = max(0, cur + delta)   # bonus never goes below 0
+    await db_call(uupdate, {'user_id': int(target_id)}, {'$set': {'bonus_accounts': new}}, upsert=True)
+    eff = await db_call(get_user_max_accounts, int(target_id))  # cache was invalidated -> fresh
+
+    sign = f"+{delta}" if delta >= 0 else str(delta)
+    await event.respond(
+        f"✅ Account-limit bonus for <code>{target_id}</code>: {cur} → <b>{new}</b> ({sign}).\n"
+        f"New total limit: <b>{eff}</b> accounts.\n\n"
+        f"<i>Live now — dashboard, add-account check, and DB all use it.</i>",
+        parse_mode='html')
+    try:
+        await main_bot.send_message(
+            int(target_id),
+            f"🎁 <b>Account limit increased!</b>\n\nYou can now add up to <b>{eff}</b> accounts.",
+            parse_mode='html')
+    except Exception:
+        pass
 
 
 @main_bot.on(events.NewMessage(pattern=r'^/removeacc\s+(@?[\w_]+)\s+(\S+)$'))
