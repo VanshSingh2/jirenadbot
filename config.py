@@ -42,7 +42,7 @@ PLAN_GROW = {
     'price_display': '₹199',
     'tagline': 'Scale your reach with multiple accounts',
     'emoji': '📈',
-    'max_accounts': 3,
+    'max_accounts': 2,
     'msg_delay': 30,
     'round_delay': 600,
     'auto_reply_enabled': True,
@@ -51,7 +51,7 @@ PLAN_GROW = {
     'max_auto_groups': 100,
     'max_groups_per_round': 100,   # rotation window per account per round (Kai)
     'logs_enabled': True,
-    'description': '3 accounts, medium delays (30s/600s), auto-reply + logs + 🔄 Smart Rotation + 👥 Auto Group Join',
+    'description': '2 accounts, medium delays (30s/600s), auto-reply + logs + 🔄 Smart Rotation + 👥 Auto Group Join',
 }
 
 PLAN_PRIME = {
@@ -60,7 +60,7 @@ PLAN_PRIME = {
     'price_display': '₹299',
     'tagline': 'Advanced automation for serious marketers',
     'emoji': '⭐',
-    'max_accounts': 5,
+    'max_accounts': 3,
     'msg_delay': 10,
     'round_delay': 120,
     'auto_reply_enabled': True,
@@ -69,7 +69,7 @@ PLAN_PRIME = {
     'max_auto_groups': 200,
     'max_groups_per_round': 150,   # rotation window per account per round (Super)
     'logs_enabled': True,
-    'description': '5 accounts, fast delays (10s/120s), full features + 🔄 Smart Rotation + 👥 Auto Group Join',
+    'description': '3 accounts, fast delays (10s/120s), full features + 🔄 Smart Rotation + 👥 Auto Group Join',
 }
 
 PLAN_DOMINION = {
@@ -78,7 +78,7 @@ PLAN_DOMINION = {
     'price_display': '₹399',
     'tagline': 'Ultimate power for advertising domination',
     'emoji': '👑',
-    'max_accounts': 5,
+    'max_accounts': 4,
     'msg_delay': 10,
     'round_delay': 120,
     'auto_reply_enabled': True,
@@ -87,7 +87,7 @@ PLAN_DOMINION = {
     'max_auto_groups': 400,
     'max_groups_per_round': 200,   # rotation window per account per round (Ultra)
     'logs_enabled': True,
-    'description': '5 accounts, fastest delays (10s/120s), priority support + 🔄 Smart Rotation + 👥 Auto Group Join',
+    'description': '4 accounts, fastest delays (10s/120s), priority support + 🔄 Smart Rotation + 👥 Auto Group Join',
 }
 
 PLANS = {

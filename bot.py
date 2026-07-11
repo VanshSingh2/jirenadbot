@@ -797,10 +797,11 @@ def is_premium(user_id):
     return True
 
 def has_per_account_config_access(user_id):
-    """Check if user can access per-account config (Super/Ultra only)."""
+    """Check if user can access per-account config (Super/Ultra only).
+    Super=3, Ultra=4, Kai=2 -> threshold >=3 keeps Super/Ultra in, Kai out."""
     if is_admin(user_id):
         return True
-    return get_user_max_accounts(user_id) >= 5
+    return get_user_max_accounts(user_id) >= 3
 
 def get_user_tier_settings(user_id):
     if is_premium(user_id):
@@ -4304,9 +4305,9 @@ async def cmd_upgrade(event):
     plan_msg = (
         "**Choose Your Plan**\n\n"
         "Pick what fits your scale. You can upgrade anytime.\n\n"
-        "• Kai — 3 accounts (₹199)\n"
-        "• Super — 5 accounts (₹299)\n"
-        "• Ultra — 5 accounts (₹399)"
+        "• Kai — 2 accounts (₹199)\n"
+        "• Super — 3 accounts (₹299)\n"
+        "• Ultra — 4 accounts (₹399)"
     )
     
     welcome_image = MESSAGES.get('welcome_image', '')
@@ -5123,9 +5124,9 @@ async def callback(event):
                 # User has accounts, show plan selection
                 plan_msg = (
                     "**Choose Your Plan to Continue**\n\n"
-                    "• Kai — 3 accounts (₹199)\n"
-                    "• Super — 5 accounts (₹299)\n"
-                    "• Ultra — 5 accounts (₹399)"
+                    "• Kai — 2 accounts (₹199)\n"
+                    "• Super — 3 accounts (₹299)\n"
+                    "• Ultra — 4 accounts (₹399)"
                 )
                 
                 welcome_image = MESSAGES.get('welcome_image', '')
@@ -6350,9 +6351,9 @@ async def callback(event):
             plan_msg = (
                 "**Choose Your Plan**\n\n"
                 "Pick what fits your scale. You can upgrade anytime.\n\n"
-                "• Kai — 3 accounts (₹199)\n"
-                "• Super — 5 accounts (₹299)\n"
-                "• Ultra — 5 accounts (₹399)"
+                "• Kai — 2 accounts (₹199)\n"
+                "• Super — 3 accounts (₹299)\n"
+                "• Ultra — 4 accounts (₹399)"
             )
             
             welcome_image = MESSAGES.get('welcome_image', '')
@@ -7677,9 +7678,9 @@ async def callback(event):
                 f"<b>Grant Plan</b>\n\n"
                 f"<b>User ID:</b> <code>{target_id}</code>\n\n"
                 f"<i>Select a plan to grant (30 days):</i>\n\n"
-                f"<b>📈 Kai:</b> 3 accounts, medium speed\n"
-                f"<b>⭐ Super:</b> 5 accounts, fast speed\n"
-                f"<b>👑 Ultra:</b> 5 accounts, fastest speed"
+                f"<b>📈 Kai:</b> 2 accounts, medium speed\n"
+                f"<b>⭐ Super:</b> 3 accounts, fast speed\n"
+                f"<b>👑 Ultra:</b> 4 accounts, fastest speed"
             )
             
             buttons = [
@@ -9527,9 +9528,9 @@ async def text_handler(event):
                     f"Phone: {state['phone']}\n"
                     f"Groups found: {count}\n\n"
                     f"Choose a plan to continue:\n"
-                    f"• Kai — 3 accounts (₹199)\n"
-                    f"• Super — 5 accounts (₹299)\n"
-                    f"• Ultra — 5 accounts (₹399)"
+                    f"• Kai — 2 accounts (₹199)\n"
+                    f"• Super — 3 accounts (₹299)\n"
+                    f"• Ultra — 4 accounts (₹399)"
                 )
                 
                 welcome_image = MESSAGES.get('welcome_image', '')
@@ -9632,9 +9633,9 @@ async def text_handler(event):
                     f"Phone: {state['phone']}\n"
                     f"Groups found: {count}\n\n"
                     f"Choose a plan to continue:\n"
-                    f"• Kai — 3 accounts (₹199)\n"
-                    f"• Super — 5 accounts (₹299)\n"
-                    f"• Ultra — 5 accounts (₹399)"
+                    f"• Kai — 2 accounts (₹199)\n"
+                    f"• Super — 3 accounts (₹299)\n"
+                    f"• Ultra — 4 accounts (₹399)"
                 )
                 
                 welcome_image = MESSAGES.get('welcome_image', '')
@@ -9930,10 +9931,10 @@ async def grant_premium_to_user(target_id: int, plan_key: str, days: int, *, sou
     """Single source of truth for premium granting + user DM + channel log."""
     plan_key = plan_key.lower().strip()
     plan_map = {
-        'grow': {'max_accounts': 3, 'price': 199, 'name': 'Kai', 'image_key': 'grow'},
-        'prime': {'max_accounts': 5, 'price': 299, 'name': 'Super', 'image_key': 'prime'},
-        'domi': {'max_accounts': 5, 'price': 399, 'name': 'Ultra', 'image_key': 'dominion'},
-        'dominion': {'max_accounts': 5, 'price': 399, 'name': 'Ultra', 'image_key': 'dominion'},
+        'grow': {'max_accounts': 2, 'price': 199, 'name': 'Kai', 'image_key': 'grow'},
+        'prime': {'max_accounts': 3, 'price': 299, 'name': 'Super', 'image_key': 'prime'},
+        'domi': {'max_accounts': 4, 'price': 399, 'name': 'Ultra', 'image_key': 'dominion'},
+        'dominion': {'max_accounts': 4, 'price': 399, 'name': 'Ultra', 'image_key': 'dominion'},
     }
     if plan_key not in plan_map:
         raise ValueError(f"Invalid plan_key: {plan_key}")
@@ -11550,9 +11551,9 @@ async def admin_grant_premium_menu(event):
     help_text = (
         "<b>💎 Grant Premium Commands</b>\n\n"
         "<b>Usage:</b>\n"
-        "<code>/kai userid|@username days</code> - Grant Kai plan (3 accounts)\n"
-        "<code>/super userid|@username days</code> - Grant Super plan (5 accounts)\n"
-        "<code>/ultra userid|@username days</code> - Grant Ultra plan (5 accounts)\n\n"
+        "<code>/kai userid|@username days</code> - Grant Kai plan (2 accounts)\n"
+        "<code>/super userid|@username days</code> - Grant Super plan (3 accounts)\n"
+        "<code>/ultra userid|@username days</code> - Grant Ultra plan (4 accounts)\n\n"
         "<b>Examples:</b>\n"
         "<code>/kai 123456789 30</code>\n"
         "<code>/super @username 60</code>\n"
