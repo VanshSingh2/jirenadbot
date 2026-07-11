@@ -31,6 +31,7 @@ PLAN_SCOUT = {
     'max_topics': 2,
     'max_groups_per_topic': 10,
     'max_auto_groups': 0,
+    'max_groups_per_round': 0,   # legacy/disabled: uncapped (no accounts anyway)
     'logs_enabled': False,
     'description': 'Legacy plan (disabled)',
 }
@@ -48,6 +49,7 @@ PLAN_GROW = {
     'max_topics': 5,
     'max_groups_per_topic': 50,
     'max_auto_groups': 100,
+    'max_groups_per_round': 100,   # rotation window per account per round (Kai)
     'logs_enabled': True,
     'description': '3 accounts, medium delays (30s/600s), auto-reply + logs + 🔄 Smart Rotation + 👥 Auto Group Join',
 }
@@ -65,6 +67,7 @@ PLAN_PRIME = {
     'max_topics': 9,
     'max_groups_per_topic': 100,
     'max_auto_groups': 200,
+    'max_groups_per_round': 150,   # rotation window per account per round (Super)
     'logs_enabled': True,
     'description': '5 accounts, fast delays (10s/120s), full features + 🔄 Smart Rotation + 👥 Auto Group Join',
 }
@@ -82,6 +85,7 @@ PLAN_DOMINION = {
     'max_topics': 15,
     'max_groups_per_topic': 200,
     'max_auto_groups': 400,
+    'max_groups_per_round': 200,   # rotation window per account per round (Ultra)
     'logs_enabled': True,
     'description': '5 accounts, fastest delays (10s/120s), priority support + 🔄 Smart Rotation + 👥 Auto Group Join',
 }

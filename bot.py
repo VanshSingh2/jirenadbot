@@ -819,6 +819,18 @@ def get_user_auto_group_limit(user_id):
         return PLANS[plan_key].get('max_auto_groups')
     return PREMIUM_TIER.get('max_auto_groups')
 
+def _groups_per_round_for_user(user):
+    """Per-round group cap (rotation window) from the user's plan. 0 = unlimited.
+    PURE function on the already-loaded `user` doc -> adds NO DB call in the hot
+    forwarding loop (uses in-memory config + the round's user document)."""
+    try:
+        plan_key = normalize_plan_key(user.get('plan') or user.get('plan_name'))
+        if plan_key in PLANS:
+            return int(PLANS[plan_key].get('max_groups_per_round', 0) or 0)
+    except Exception:
+        pass
+    return 0   # unknown / legacy / admin (no plan set) -> uncapped
+
 def get_user_max_accounts(user_id):
     if is_admin(user_id):
         return 999  # Admins get unlimited accounts
@@ -2364,13 +2376,24 @@ async def run_forwarding_loop(user_id, account_id):
                             groups_to_forward = groups_to_forward[:cap]
                             print(f"[FORWARDING] {account_id}: warmup {age_days:.1f}d -> {cap} groups")
 
-                # ---- Smart rotation: send one rotating chunk per round ----
+                # ---- Per-round group window: plan cap + optional smart rotation ----
+                # ONE sliding window handles both the per-plan per-round cap
+                # (Kai 100 / Super 150 / Ultra 200) AND smart rotation, so groups
+                # ROTATE each round (no group is starved) and the frequency math
+                # (rotation_buckets) stays correct. All inputs are already in memory
+                # (user doc + config), so this adds NO extra DB calls.
                 rotation_buckets = 1
-                if user.get('smart_rotation') and len(groups_to_forward) > ROTATION_CHUNK:
-                    total_g = len(groups_to_forward)
-                    rotation_buckets = (total_g + ROTATION_CHUNK - 1) // ROTATION_CHUNK  # integer ceil
-                    start = (rotation_offset % rotation_buckets) * ROTATION_CHUNK
-                    groups_to_forward = groups_to_forward[start:start + ROTATION_CHUNK]
+                total_g = len(groups_to_forward)
+                window = total_g
+                plan_round_cap = _groups_per_round_for_user(user)   # 0 = unlimited
+                if plan_round_cap and plan_round_cap < window:
+                    window = plan_round_cap
+                if user.get('smart_rotation') and ROTATION_CHUNK < window:
+                    window = ROTATION_CHUNK
+                if window < total_g:
+                    rotation_buckets = (total_g + window - 1) // window   # integer ceil
+                    start = (rotation_offset % rotation_buckets) * window
+                    groups_to_forward = groups_to_forward[start:start + window]
                     rotation_offset += 1
 
                 # ---- Target-frequency pacing -------------------------------
@@ -4405,40 +4428,8 @@ async def cmd_broadcast(event):
     asyncio.create_task(_run_text_broadcast(event.chat_id, msg))
     await event.respond("📢 Broadcast started in the background. I'll send a summary here when it finishes.")
 
-@main_bot.on(events.NewMessage(pattern=r'^/health(?:@[\w_]+)?(?:\s|$)'))
-async def cmd_health(event):
-    """Admin: quick health/metrics snapshot for this process."""
-    uid = event.sender_id
-    if not is_admin(uid):
-        return
-    local_active = sum(1 for t in forwarding_tasks.values() if not t.done())
-    try:
-        db_active = await db_call(lambda: accounts_col.count_documents({'is_forwarding': True}))
-        total_users = await db_call(lambda: users_col.count_documents({}))
-        total_accounts = await db_call(lambda: accounts_col.count_documents({}))
-    except Exception as e:
-        db_active = total_users = total_accounts = f"err: {e}"
-    try:
-        proc = psutil.Process()
-        mem_mb = proc.memory_info().rss / (1024 * 1024)
-        cpu = psutil.cpu_percent(interval=0.0)
-    except Exception:
-        mem_mb = cpu = -1
-    uptime = _format_duration(int(time.time() - BOT_START_TIME))
-    text = (
-        "<b>🩺 Health</b>\n\n"
-        f"<b>Role:</b> <code>{BOT_ROLE}</code>\n"
-        f"<b>Worker:</b> <code>{WORKER_ID}/{WORKER_COUNT}</code>\n"
-        f"<b>Proxies:</b> <code>{len(RUNTIME_PROXIES)}</code>\n"
-        f"<b>Uptime:</b> <code>{uptime}</code>\n\n"
-        f"<b>Active here:</b> <code>{local_active}</code>\n"
-        f"<b>Active (DB):</b> <code>{db_active}</code>\n"
-        f"<b>Accounts:</b> <code>{total_accounts}</code>\n"
-        f"<b>Users:</b> <code>{total_users}</code>\n\n"
-        f"<b>RSS:</b> <code>{mem_mb:.0f} MB</code>\n"
-        f"<b>CPU:</b> <code>{cpu:.0f}%</code>"
-    )
-    await event.respond(text, parse_mode='html')
+# NOTE: /health is defined once, in the OPS MANAGER section (cluster-wide report).
+# The old per-process snapshot handler was removed to avoid a duplicate double-reply.
 
 
 @main_bot.on(events.NewMessage(pattern=r'^/freq(?:@[\w_]+)?\s+(\d+)$'))
