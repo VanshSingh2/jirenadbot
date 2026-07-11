@@ -16,7 +16,7 @@ BOT_CONFIG = {
 }
 
 # ===================== PLAN TIERS =====================
-# Kai (₹199), Super (₹299), Ultra (₹399)
+# Starter (₹199), Pro (₹299), Elite (₹399)
 
 PLAN_SCOUT = {
     'name': 'Legacy',
@@ -37,7 +37,7 @@ PLAN_SCOUT = {
 }
 
 PLAN_GROW = {
-    'name': 'Kai',
+    'name': 'Starter',
     'price': 199,
     'price_display': '₹199',
     'tagline': 'Scale your reach with multiple accounts',
@@ -49,13 +49,13 @@ PLAN_GROW = {
     'max_topics': 5,
     'max_groups_per_topic': 50,
     'max_auto_groups': 100,
-    'max_groups_per_round': 100,   # rotation window per account per round (Kai)
+    'max_groups_per_round': 100,   # rotation window per account per round (Starter)
     'logs_enabled': True,
     'description': '2 accounts, medium delays (30s/600s), auto-reply + logs + 🔄 Smart Rotation + 👥 Auto Group Join',
 }
 
 PLAN_PRIME = {
-    'name': 'Super',
+    'name': 'Pro',
     'price': 299,
     'price_display': '₹299',
     'tagline': 'Advanced automation for serious marketers',
@@ -67,13 +67,13 @@ PLAN_PRIME = {
     'max_topics': 9,
     'max_groups_per_topic': 100,
     'max_auto_groups': 200,
-    'max_groups_per_round': 150,   # rotation window per account per round (Super)
+    'max_groups_per_round': 150,   # rotation window per account per round (Pro)
     'logs_enabled': True,
     'description': '3 accounts, fast delays (10s/120s), full features + 🔄 Smart Rotation + 👥 Auto Group Join',
 }
 
 PLAN_DOMINION = {
-    'name': 'Ultra',
+    'name': 'Elite',
     'price': 399,
     'price_display': '₹399',
     'tagline': 'Ultimate power for advertising domination',
@@ -85,7 +85,7 @@ PLAN_DOMINION = {
     'max_topics': 15,
     'max_groups_per_topic': 200,
     'max_auto_groups': 400,
-    'max_groups_per_round': 200,   # rotation window per account per round (Ultra)
+    'max_groups_per_round': 200,   # rotation window per account per round (Elite)
     'logs_enabled': True,
     'description': '4 accounts, fastest delays (10s/120s), priority support + 🔄 Smart Rotation + 👥 Auto Group Join',
 }

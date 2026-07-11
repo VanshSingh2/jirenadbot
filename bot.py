@@ -797,8 +797,8 @@ def is_premium(user_id):
     return True
 
 def has_per_account_config_access(user_id):
-    """Check if user can access per-account config (Super/Ultra only).
-    Super=3, Ultra=4, Kai=2 -> threshold >=3 keeps Super/Ultra in, Kai out."""
+    """Check if user can access per-account config (Pro/Elite only).
+    Pro=3, Elite=4, Starter=2 -> threshold >=3 keeps Pro/Elite in, Starter out."""
     if is_admin(user_id):
         return True
     return get_user_max_accounts(user_id) >= 3
@@ -843,6 +843,11 @@ def normalize_plan_key(value: str) -> str:
     if not key:
         return ""
     name_map = {
+        # new display names
+        'starter': 'grow',
+        'pro': 'prime',
+        'elite': 'dominion',
+        # legacy display names (existing users' stored plan_name) -> still resolve
         'kai': 'grow',
         'super': 'prime',
         'ultra': 'dominion',
@@ -858,9 +863,9 @@ def normalize_plan_key(value: str) -> str:
 def get_plan_label(plan_key: str) -> str:
     key = normalize_plan_key(plan_key)
     return {
-        'grow': 'Kai',
-        'prime': 'Super',
-        'dominion': 'Ultra',
+        'grow': 'Starter',
+        'prime': 'Pro',
+        'dominion': 'Elite',
     }.get(key, plan_key.capitalize() if plan_key else "No Plan")
 
 def get_display_plan_name(user: dict) -> str:
@@ -868,19 +873,23 @@ def get_display_plan_name(user: dict) -> str:
     if plan_name:
         normalized = plan_name.lower()
         name_map = {
-            'grow': 'Kai',
-            'prime': 'Super',
-            'dominion': 'Ultra',
-            'kai': 'Kai',
-            'super': 'Super',
-            'ultra': 'Ultra',
+            'grow': 'Starter',
+            'prime': 'Pro',
+            'dominion': 'Elite',
+            # map any stored value (new OR legacy) to the current display name
+            'starter': 'Starter',
+            'pro': 'Pro',
+            'elite': 'Elite',
+            'kai': 'Starter',
+            'super': 'Pro',
+            'ultra': 'Elite',
         }
         return name_map.get(normalized, plan_name)
     plan_key = normalize_plan_key(user.get('plan'))
     return {
-        'grow': 'Kai',
-        'prime': 'Super',
-        'dominion': 'Ultra',
+        'grow': 'Starter',
+        'prime': 'Pro',
+        'dominion': 'Elite',
     }.get(plan_key, "No Plan")
 
 def get_plan_max_accounts(user: dict) -> int:
@@ -932,7 +941,7 @@ def set_user_premium(user_id, max_accounts, plan_name='premium'):
             'tier': 'premium',
             'plan': plan_key,  # Store plan key (grow/prime/dominion) for profile display
             'max_accounts': max_accounts,
-            'plan_name': plan_label,  # Store actual plan name (Kai/Super/Ultra)
+            'plan_name': plan_label,  # Store actual plan name (Starter/Pro/Elite)
             'premium_granted_at': datetime.now(),
             'premium_expires_at': expires_at,
             'plan_expiry': expires_at,  # Add this for profile display
@@ -2385,7 +2394,7 @@ async def run_forwarding_loop(user_id, account_id):
 
                 # ---- Per-round group window: plan cap + optional smart rotation ----
                 # ONE sliding window handles both the per-plan per-round cap
-                # (Kai 100 / Super 150 / Ultra 200) AND smart rotation, so groups
+                # (Starter 100 / Pro 150 / Elite 200) AND smart rotation, so groups
                 # ROTATE each round (no group is starved) and the frequency math
                 # (rotation_buckets) stays correct. All inputs are already in memory
                 # (user doc + config), so this adds NO extra DB calls.
@@ -3205,7 +3214,7 @@ def render_plan_select_text() -> str:
     return (
         "<b>Choose Your Plan</b>\n\n"
         "Pick what fits your scale. You can upgrade anytime.\n\n"
-        "Plans: Kai • Super • Ultra"
+        "Plans: Starter • Pro • Elite"
     )
 
 
@@ -3232,11 +3241,11 @@ def render_dashboard_text(uid: int) -> str:
         if plan_name == "No Plan":
             # Backward compatibility: derive from max_accounts
             if max_acc >= 15:
-                plan_name = "Ultra"
+                plan_name = "Elite"
             elif max_acc >= 7:
-                plan_name = "Super"
+                plan_name = "Pro"
             else:
-                plan_name = "Kai"
+                plan_name = "Starter"
         
         # Calculate expiry countdown
         expires_at = user.get('premium_expires_at')
@@ -3293,7 +3302,7 @@ def new_welcome_keyboard():
     ]
 
 def plan_select_keyboard(user_id=None):
-    """Plan selection: Kai, Super, Ultra (2x2 grid layout)."""
+    """Plan selection: Starter, Pro, Elite (2x2 grid layout)."""
     user = get_user(user_id) if user_id else None
     user_plan = normalize_plan_key(user.get('plan') or user.get('plan_name')) if user else ""
     is_prem = is_premium(user_id) if user_id else False
@@ -3309,15 +3318,15 @@ def plan_select_keyboard(user_id=None):
 
     buttons = []
 
-    # First row: Kai
+    # First row: Starter
     row1 = []
-    grow_label = "✓ Kai (Active)" if user_plan == 'grow' and is_prem else f"Kai ({PLANS['grow']['price_display']})"
+    grow_label = "✓ Starter (Active)" if user_plan == 'grow' and is_prem else f"Starter ({PLANS['grow']['price_display']})"
     row1.append(Button.inline(grow_label, b"plan_grow"))
     buttons.append(row1)
 
-    # Second row: Super + Ultra
-    prime_label = "✓ Super (Active)" if user_plan == 'prime' and is_prem else f"Super ({PLANS['prime']['price_display']})"
-    dominion_label = "✓ Ultra (Active)" if user_plan == 'dominion' and is_prem else f"Ultra ({PLANS['dominion']['price_display']})"
+    # Second row: Pro + Elite
+    prime_label = "✓ Pro (Active)" if user_plan == 'prime' and is_prem else f"Pro ({PLANS['prime']['price_display']})"
+    dominion_label = "✓ Elite (Active)" if user_plan == 'dominion' and is_prem else f"Elite ({PLANS['dominion']['price_display']})"
     buttons.append([
         Button.inline(prime_label, b"plan_prime"),
         Button.inline(dominion_label, b"plan_dominion")
@@ -3753,7 +3762,7 @@ def interval_menu_keyboard(user_id):
     medium = Button.inline(f"{INTERVAL_PRESETS['medium']['name']}{mark_for('medium')}", b"interval_medium")
     fast = Button.inline(f"{INTERVAL_PRESETS['fast']['name']}{mark_for('fast')}", b"interval_fast")
 
-    # Custom intervals are premium-only (Kai, Super, Ultra plans)
+    # Custom intervals are premium-only (Starter, Pro, Elite plans)
     if is_premium(user_id):
         custom_mark = " ✅" if current == 'custom' else ""
         custom = Button.inline(f"Custom Settings{custom_mark}", b"interval_custom")
@@ -4311,9 +4320,9 @@ async def cmd_upgrade(event):
     plan_msg = (
         "**Choose Your Plan**\n\n"
         "Pick what fits your scale. You can upgrade anytime.\n\n"
-        "• Kai — 2 accounts (₹199)\n"
-        "• Super — 3 accounts (₹299)\n"
-        "• Ultra — 4 accounts (₹399)"
+        "• Starter — 2 accounts (₹199)\n"
+        "• Pro — 3 accounts (₹299)\n"
+        "• Elite — 4 accounts (₹399)"
     )
     
     welcome_image = MESSAGES.get('welcome_image', '')
@@ -4963,9 +4972,9 @@ async def callback(event):
                     f"├ <b>💎 Premium Users:</b> <code>{premium_users}</code>\n"
                     f"└ <b>🚫 Banned Users:</b> <code>{banned_users}</code>\n\n"
                     "<b>💎 Premium by Plan:</b>\n"
-                    f"├ <b>📈 Kai:</b> <code>{grow_count}</code>\n"
-                    f"├ <b>⭐ Super:</b> <code>{prime_count}</code>\n"
-                    f"└ <b>👑 Ultra:</b> <code>{dominion_count}</code>\n\n"
+                    f"├ <b>📈 Starter:</b> <code>{grow_count}</code>\n"
+                    f"├ <b>⭐ Pro:</b> <code>{prime_count}</code>\n"
+                    f"└ <b>👑 Elite:</b> <code>{dominion_count}</code>\n\n"
                     "<b>📱 Account Statistics:</b>\n"
                     f"├ <b>Total Accounts:</b> <code>{total_accounts}</code>\n"
                     f"└ <b>▶️ Active Broadcasts:</b> <code>{active_broadcasts}</code>\n\n"
@@ -5130,9 +5139,9 @@ async def callback(event):
                 # User has accounts, show plan selection
                 plan_msg = (
                     "**Choose Your Plan to Continue**\n\n"
-                    "• Kai — 2 accounts (₹199)\n"
-                    "• Super — 3 accounts (₹299)\n"
-                    "• Ultra — 4 accounts (₹399)"
+                    "• Starter — 2 accounts (₹199)\n"
+                    "• Pro — 3 accounts (₹299)\n"
+                    "• Elite — 4 accounts (₹399)"
                 )
                 
                 welcome_image = MESSAGES.get('welcome_image', '')
@@ -5833,7 +5842,7 @@ async def callback(event):
             text = (
                 "<b>Paid Plan Feature</b>\n\n"
                 "Custom intervals are available on paid plans only.\n"
-                "Upgrade to Kai, Super, or Ultra to unlock custom timing."
+                "Upgrade to Starter, Pro, or Elite to unlock custom timing."
             )
             await event.edit(text, parse_mode='html', buttons=[
                 [Button.inline("💎 View Plans", b"back_plans")],
@@ -6357,9 +6366,9 @@ async def callback(event):
             plan_msg = (
                 "**Choose Your Plan**\n\n"
                 "Pick what fits your scale. You can upgrade anytime.\n\n"
-                "• Kai — 2 accounts (₹199)\n"
-                "• Super — 3 accounts (₹299)\n"
-                "• Ultra — 4 accounts (₹399)"
+                "• Starter — 2 accounts (₹199)\n"
+                "• Pro — 3 accounts (₹299)\n"
+                "• Elite — 4 accounts (₹399)"
             )
             
             welcome_image = MESSAGES.get('welcome_image', '')
@@ -7684,15 +7693,15 @@ async def callback(event):
                 f"<b>Grant Plan</b>\n\n"
                 f"<b>User ID:</b> <code>{target_id}</code>\n\n"
                 f"<i>Select a plan to grant (30 days):</i>\n\n"
-                f"<b>📈 Kai:</b> 2 accounts, medium speed\n"
-                f"<b>⭐ Super:</b> 3 accounts, fast speed\n"
-                f"<b>👑 Ultra:</b> 4 accounts, fastest speed"
+                f"<b>📈 Starter:</b> 2 accounts, medium speed\n"
+                f"<b>⭐ Pro:</b> 3 accounts, fast speed\n"
+                f"<b>👑 Elite:</b> 4 accounts, fastest speed"
             )
             
             buttons = [
-                [Button.inline("📈 Kai", f"admin_grant_grow_{target_id}")],
-                [Button.inline("⭐ Super", f"admin_grant_prime_{target_id}")],
-                [Button.inline("👑 Ultra", f"admin_grant_dominion_{target_id}")],
+                [Button.inline("📈 Starter", f"admin_grant_grow_{target_id}")],
+                [Button.inline("⭐ Pro", f"admin_grant_prime_{target_id}")],
+                [Button.inline("👑 Elite", f"admin_grant_dominion_{target_id}")],
                 [Button.inline("← Back", f"admin_user_detail_{target_id}")]
             ]
             
@@ -7724,15 +7733,15 @@ async def callback(event):
                 # Use centralized function - handles DB, user notification, AND channel notification
                 await grant_premium_to_user(target_id, 'grow', days, source='admin_user_profile')
                 
-                await event.answer("✅ Kai plan granted!", alert=True)
+                await event.answer("✅ Starter plan granted!", alert=True)
                 await event.edit(
-                    f"<b>✅ Plan Granted</b>\n\n<i>User {target_id} now has Kai plan access (30 days).</i>",
+                    f"<b>✅ Plan Granted</b>\n\n<i>User {target_id} now has Starter plan access (30 days).</i>",
                     parse_mode='html',
                     buttons=[[Button.inline("← Back to Users", b"admin_all_users")]]
                 )
             except Exception as e:
                 await event.answer(f"❌ Error: {str(e)[:50]}", alert=True)
-                print(f"[ADMIN] Failed to grant Kai to {target_id}: {e}")
+                print(f"[ADMIN] Failed to grant Starter to {target_id}: {e}")
             return
         
         if data.startswith("admin_grant_prime_"):
@@ -7746,15 +7755,15 @@ async def callback(event):
                 # Use centralized function - handles DB, user notification, AND channel notification
                 await grant_premium_to_user(target_id, 'prime', days, source='admin_user_profile')
                 
-                await event.answer("✅ Super plan granted!", alert=True)
+                await event.answer("✅ Pro plan granted!", alert=True)
                 await event.edit(
-                    f"<b>✅ Plan Granted</b>\n\n<i>User {target_id} now has Super plan access (30 days).</i>",
+                    f"<b>✅ Plan Granted</b>\n\n<i>User {target_id} now has Pro plan access (30 days).</i>",
                     parse_mode='html',
                     buttons=[[Button.inline("← Back to Users", b"admin_all_users")]]
                 )
             except Exception as e:
                 await event.answer(f"❌ Error: {str(e)[:50]}", alert=True)
-                print(f"[ADMIN] Failed to grant Super to {target_id}: {e}")
+                print(f"[ADMIN] Failed to grant Pro to {target_id}: {e}")
             return
         
         if data.startswith("admin_grant_dominion_"):
@@ -7768,15 +7777,15 @@ async def callback(event):
                 # Use centralized function - handles DB, user notification, AND channel notification
                 await grant_premium_to_user(target_id, 'dominion', days, source='admin_user_profile')
                 
-                await event.answer("✅ Ultra plan granted!", alert=True)
+                await event.answer("✅ Elite plan granted!", alert=True)
                 await event.edit(
-                    f"<b>✅ Plan Granted</b>\n\n<i>User {target_id} now has Ultra plan access (30 days).</i>",
+                    f"<b>✅ Plan Granted</b>\n\n<i>User {target_id} now has Elite plan access (30 days).</i>",
                     parse_mode='html',
                     buttons=[[Button.inline("← Back to Users", b"admin_all_users")]]
                 )
             except Exception as e:
                 await event.answer(f"❌ Error: {str(e)[:50]}", alert=True)
-                print(f"[ADMIN] Failed to grant Ultra to {target_id}: {e}")
+                print(f"[ADMIN] Failed to grant Elite to {target_id}: {e}")
             return
         
         if data.startswith("admin_revoke_premium_"):
@@ -7866,15 +7875,15 @@ async def callback(event):
                 await event.answer("Not found!", alert=True)
                 return
             
-            # Check if user has per-account config access (Super/Ultra)
+            # Check if user has per-account config access (Pro/Elite)
             if not has_per_account_config_access(uid):
-                await event.answer("Per-account config is a Super/Ultra feature!", alert=True)
+                await event.answer("Per-account config is a Pro/Elite feature!", alert=True)
                 await event.edit(
                     "🔒 **Per-Account Configuration**\n\n"
                     "This feature allows you to customize settings for each account individually.\n\n"
                     "Available in:\n"
-                    "• Super Plan (₹299)\n"
-                    "• Ultra Plan (₹399)\n\n"
+                    "• Pro Plan (₹299)\n"
+                    "• Elite Plan (₹399)\n\n"
                     "Use main dashboard settings to control all accounts together.",
                     buttons=[[Button.inline("⬆️ Upgrade Plan", b"go_premium")], [Button.inline("🏠 Dashboard", b"enter_dashboard")]]
                 )
@@ -9534,9 +9543,9 @@ async def text_handler(event):
                     f"Phone: {state['phone']}\n"
                     f"Groups found: {count}\n\n"
                     f"Choose a plan to continue:\n"
-                    f"• Kai — 2 accounts (₹199)\n"
-                    f"• Super — 3 accounts (₹299)\n"
-                    f"• Ultra — 4 accounts (₹399)"
+                    f"• Starter — 2 accounts (₹199)\n"
+                    f"• Pro — 3 accounts (₹299)\n"
+                    f"• Elite — 4 accounts (₹399)"
                 )
                 
                 welcome_image = MESSAGES.get('welcome_image', '')
@@ -9639,9 +9648,9 @@ async def text_handler(event):
                     f"Phone: {state['phone']}\n"
                     f"Groups found: {count}\n\n"
                     f"Choose a plan to continue:\n"
-                    f"• Kai — 2 accounts (₹199)\n"
-                    f"• Super — 3 accounts (₹299)\n"
-                    f"• Ultra — 4 accounts (₹399)"
+                    f"• Starter — 2 accounts (₹199)\n"
+                    f"• Pro — 3 accounts (₹299)\n"
+                    f"• Elite — 4 accounts (₹399)"
                 )
                 
                 welcome_image = MESSAGES.get('welcome_image', '')
@@ -9937,10 +9946,10 @@ async def grant_premium_to_user(target_id: int, plan_key: str, days: int, *, sou
     """Single source of truth for premium granting + user DM + channel log."""
     plan_key = plan_key.lower().strip()
     plan_map = {
-        'grow': {'max_accounts': 2, 'price': 199, 'name': 'Kai', 'image_key': 'grow'},
-        'prime': {'max_accounts': 3, 'price': 299, 'name': 'Super', 'image_key': 'prime'},
-        'domi': {'max_accounts': 4, 'price': 399, 'name': 'Ultra', 'image_key': 'dominion'},
-        'dominion': {'max_accounts': 4, 'price': 399, 'name': 'Ultra', 'image_key': 'dominion'},
+        'grow': {'max_accounts': 2, 'price': 199, 'name': 'Starter', 'image_key': 'grow'},
+        'prime': {'max_accounts': 3, 'price': 299, 'name': 'Pro', 'image_key': 'prime'},
+        'domi': {'max_accounts': 4, 'price': 399, 'name': 'Elite', 'image_key': 'dominion'},
+        'dominion': {'max_accounts': 4, 'price': 399, 'name': 'Elite', 'image_key': 'dominion'},
     }
     if plan_key not in plan_map:
         raise ValueError(f"Invalid plan_key: {plan_key}")
@@ -10057,9 +10066,9 @@ async def handle_notification_actions(event):
         )
         
         buttons = [
-            [Button.inline("📈 Kai (₹199)", f"grantplan_grow_{target_user_id}")],
-            [Button.inline("⭐ Super (₹299)", f"grantplan_prime_{target_user_id}")],
-            [Button.inline("👑 Ultra (₹399)", f"grantplan_domi_{target_user_id}")],
+            [Button.inline("📈 Starter (₹199)", f"grantplan_grow_{target_user_id}")],
+            [Button.inline("⭐ Pro (₹299)", f"grantplan_prime_{target_user_id}")],
+            [Button.inline("👑 Elite (₹399)", f"grantplan_domi_{target_user_id}")],
             [Button.inline("← Cancel", b"notif_cancel")]
         ]
         
@@ -11557,13 +11566,13 @@ async def admin_grant_premium_menu(event):
     help_text = (
         "<b>💎 Grant Premium Commands</b>\n\n"
         "<b>Usage:</b>\n"
-        "<code>/kai userid|@username days</code> - Grant Kai plan (2 accounts)\n"
-        "<code>/super userid|@username days</code> - Grant Super plan (3 accounts)\n"
-        "<code>/ultra userid|@username days</code> - Grant Ultra plan (4 accounts)\n\n"
+        "<code>/starter userid|@username days</code> - Grant Starter plan (2 accounts)\n"
+        "<code>/pro userid|@username days</code> - Grant Pro plan (3 accounts)\n"
+        "<code>/elite userid|@username days</code> - Grant Elite plan (4 accounts)\n\n"
         "<b>Examples:</b>\n"
-        "<code>/kai 123456789 30</code>\n"
-        "<code>/super @username 60</code>\n"
-        "<code>/ultra 555444333 90</code>\n\n"
+        "<code>/starter 123456789 30</code>\n"
+        "<code>/pro @username 60</code>\n"
+        "<code>/elite 555444333 90</code>\n\n"
         "<i>User will receive instant notification with plan activation.</i>"
     )
     await event.edit(help_text, parse_mode='html', buttons=[[Button.inline("← Back", b"admin_panel")]])
@@ -11663,7 +11672,7 @@ async def cmd_removeacc(event):
         parse_mode='html'
     )
 
-# Admin commands for granting premium: /kai /super /ultra (aliases: /grow /prime /domi)
+# Admin commands for granting premium: /starter /pro /elite (aliases: /kai /super /ultra, /grow /prime /domi)
 async def _grant_plan_from_command(event, plan_key: str, plan_label: str, source: str):
     if not is_admin(event.sender_id):
         return
@@ -11684,34 +11693,51 @@ async def _grant_plan_from_command(event, plan_key: str, plan_label: str, source
         print(f"[ADMIN CMD] {source} failed: {e}")
 
 
+# Primary grant commands: /starter /pro /elite. Old names (/kai /super /ultra) and
+# key names (/grow /prime /domi) are kept as aliases so nothing breaks.
+@main_bot.on(events.NewMessage(pattern=r'^/starter\s+(@?[\w_]+)\s+(\d+)$'))
+async def cmd_starter(event):
+    await _grant_plan_from_command(event, 'grow', 'Starter', '/starter')
+
+
+@main_bot.on(events.NewMessage(pattern=r'^/pro\s+(@?[\w_]+)\s+(\d+)$'))
+async def cmd_pro(event):
+    await _grant_plan_from_command(event, 'prime', 'Pro', '/pro')
+
+
+@main_bot.on(events.NewMessage(pattern=r'^/elite\s+(@?[\w_]+)\s+(\d+)$'))
+async def cmd_elite(event):
+    await _grant_plan_from_command(event, 'dominion', 'Elite', '/elite')
+
+
 @main_bot.on(events.NewMessage(pattern=r'^/kai\s+(@?[\w_]+)\s+(\d+)$'))
 async def cmd_kai(event):
-    await _grant_plan_from_command(event, 'grow', 'Kai', '/kai')
+    await _grant_plan_from_command(event, 'grow', 'Starter', '/kai')
 
 
 @main_bot.on(events.NewMessage(pattern=r'^/super\s+(@?[\w_]+)\s+(\d+)$'))
 async def cmd_super(event):
-    await _grant_plan_from_command(event, 'prime', 'Super', '/super')
+    await _grant_plan_from_command(event, 'prime', 'Pro', '/super')
 
 
 @main_bot.on(events.NewMessage(pattern=r'^/ultra\s+(@?[\w_]+)\s+(\d+)$'))
 async def cmd_ultra(event):
-    await _grant_plan_from_command(event, 'dominion', 'Ultra', '/ultra')
+    await _grant_plan_from_command(event, 'dominion', 'Elite', '/ultra')
 
 
 @main_bot.on(events.NewMessage(pattern=r'^/grow\s+(@?[\w_]+)\s+(\d+)$'))
 async def cmd_grow(event):
-    await _grant_plan_from_command(event, 'grow', 'Kai', '/grow')
+    await _grant_plan_from_command(event, 'grow', 'Starter', '/grow')
 
 
 @main_bot.on(events.NewMessage(pattern=r'^/prime\s+(@?[\w_]+)\s+(\d+)$'))
 async def cmd_prime(event):
-    await _grant_plan_from_command(event, 'prime', 'Super', '/prime')
+    await _grant_plan_from_command(event, 'prime', 'Pro', '/prime')
 
 
 @main_bot.on(events.NewMessage(pattern=r'^/domi\s+(@?[\w_]+)\s+(\d+)$'))
 async def cmd_domi(event):
-    await _grant_plan_from_command(event, 'dominion', 'Ultra', '/domi')
+    await _grant_plan_from_command(event, 'dominion', 'Elite', '/domi')
 if __name__ == '__main__':
     try:
         asyncio.run(main())
