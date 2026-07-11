@@ -178,9 +178,10 @@ discovered_groups_col = db['discovered_groups']
 toxic_groups_col = db['toxic_groups']
 
 # ---- Global, admin-controlled settings (e.g. the per-group send frequency) ----
-# Frequency is a GLOBAL policy: default 3 sends/hour per group, hard-capped at 3.
-# Users cannot change it; only admins can (for testing/rollout).
-HARD_MAX_TARGET_PER_HOUR = int(os.getenv('HARD_MAX_TARGET_PER_HOUR', '3'))
+# Frequency is a GLOBAL policy: default 3 sends/hour per group. Only admins can
+# change it (1..HARD_MAX_TARGET_PER_HOUR) via /freq, /frequency, or the admin
+# Frequency button. Users cannot change it.
+HARD_MAX_TARGET_PER_HOUR = int(os.getenv('HARD_MAX_TARGET_PER_HOUR', '10'))
 DEFAULT_TARGET_PER_HOUR = int(os.getenv('DEFAULT_TARGET_PER_HOUR', '3'))
 _global_settings_cache = {}  # key -> (expires_monotonic, value)
 
@@ -825,6 +826,8 @@ def _groups_per_round_for_user(user):
     PURE function on the already-loaded `user` doc -> adds NO DB call in the hot
     forwarding loop (uses in-memory config + the round's user document)."""
     try:
+        if is_admin(user.get('user_id')):
+            return 0   # admins: no per-round group cap (unlimited)
         plan_key = normalize_plan_key(user.get('plan') or user.get('plan_name'))
         if plan_key in PLANS:
             return int(PLANS[plan_key].get('max_groups_per_round', 0) or 0)
@@ -1573,7 +1576,10 @@ def _get_quiet_hours_wait(user_id: int, user_doc=None):
         return 0, None
     label = q.get('label') or f"{start}-{end}"
 
-    now = datetime.now()
+    # Quiet-hours window is defined in IST (Asia/Kolkata, UTC+5:30). Evaluate it
+    # against IST wall-clock regardless of the server's timezone (the VPS runs UTC),
+    # otherwise the pause fires at the wrong hours.
+    now = datetime.utcnow() + timedelta(hours=5, minutes=30)
     start_h, start_m = map(int, start.split(':'))
     end_h, end_m = map(int, end.split(':'))
     start_dt = now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
@@ -4448,10 +4454,11 @@ async def cmd_broadcast(event):
 # The old per-process snapshot handler was removed to avoid a duplicate double-reply.
 
 
+@main_bot.on(events.NewMessage(pattern=r'^/frequency(?:@[\w_]+)?\s+(\d+)$'))
 @main_bot.on(events.NewMessage(pattern=r'^/freq(?:@[\w_]+)?\s+(\d+)$'))
 async def cmd_freq(event):
     """ADMIN ONLY. Set the GLOBAL per-group send frequency (times/hour) for all
-    users. Hard-capped at HARD_MAX_TARGET_PER_HOUR (default 3)."""
+    users. Range 1..HARD_MAX_TARGET_PER_HOUR (default max 10). /freq = /frequency."""
     uid = event.sender_id
     if not is_admin(uid):
         await event.respond("Frequency is managed by admin.")

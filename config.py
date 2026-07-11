@@ -66,7 +66,7 @@ PLAN_PRIME = {
     'auto_reply_enabled': True,
     'max_topics': 9,
     'max_groups_per_topic': 100,
-    'max_auto_groups': 200,
+    'max_auto_groups': 150,
     'max_groups_per_round': 150,   # rotation window per account per round (Pro)
     'logs_enabled': True,
     'description': '3 accounts, fast delays (10s/120s), full features + 🔄 Smart Rotation + 👥 Auto Group Join',
@@ -84,7 +84,7 @@ PLAN_DOMINION = {
     'auto_reply_enabled': True,
     'max_topics': 15,
     'max_groups_per_topic': 200,
-    'max_auto_groups': 400,
+    'max_auto_groups': 200,
     'max_groups_per_round': 200,   # rotation window per account per round (Elite)
     'logs_enabled': True,
     'description': '4 accounts, fastest delays (10s/120s), priority support + 🔄 Smart Rotation + 👥 Auto Group Join',
