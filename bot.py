@@ -10727,14 +10727,15 @@ async def cmd_setworkers(event):
     await event.respond(f"✅ {r1[1]}\n✅ {r2[1]}\n\n<i>Applied within ~1 min.</i>", parse_mode='html')
 
 
-@main_bot.on(events.NewMessage(pattern=r'^/nowarmup(?:@[\w_]+)?(?:\s+(\w+))?$'))
+@main_bot.on(events.NewMessage(pattern=r'^/nowarmup(?:@[\w_]+)?(?:\s+(@?[\w_]+))?$'))
 async def cmd_nowarmup(event):
     """Remove the 2-day warmup ramp so accounts send to ALL their groups immediately.
-    - /nowarmup       -> your own accounts (any user)
-    - /nowarmup all   -> every account, current + future (admin only)"""
+    - /nowarmup                    -> your own accounts (any user)
+    - /nowarmup <userid|@username> -> that user's accounts (admin only)
+    - /nowarmup all                -> every account, current + future (admin only)"""
     uid = event.sender_id
-    arg = (event.pattern_match.group(1) or '').strip().lower()
-    if arg == 'all':
+    arg = (event.pattern_match.group(1) or '').strip()
+    if arg.lower() == 'all':
         if not is_admin(uid):
             await event.respond("⚠️ Only admins can remove warmup for ALL accounts.\n"
                                 "Use <code>/nowarmup</code> (no argument) for your own.", parse_mode='html')
@@ -10744,6 +10745,22 @@ async def cmd_nowarmup(event):
                             "ramp-up and sends to all its groups immediately.\n\n"
                             "<i>Re-enable with</i> <code>/warmup all</code>.", parse_mode='html')
         return
+    # Target a specific user (admin only)
+    if arg:
+        if not is_admin(uid):
+            await event.respond("⚠️ Only admins can change warmup for another user.", parse_mode='html')
+            return
+        target_id = await resolve_target_user_id(arg, event.client)
+        if not target_id:
+            await event.respond("❌ User not found. Use a numeric id or @username.")
+            return
+        res = await db_call(accounts_col.update_many, {'owner_id': int(target_id)}, {'$set': {'skip_warmup': True}})
+        n = getattr(res, 'modified_count', 0)
+        await event.respond(f"✅ Warmup removed for user <code>{target_id}</code>'s <b>{n}</b> account(s). "
+                            "They'll send to all groups right away.\n\n"
+                            f"<i>Re-enable with</i> <code>/warmup {target_id}</code>.", parse_mode='html')
+        return
+    # Own accounts (any user)
     res = await db_call(accounts_col.update_many, {'owner_id': uid}, {'$set': {'skip_warmup': True}})
     n = getattr(res, 'modified_count', 0)
     if n == 0:
@@ -10756,12 +10773,15 @@ async def cmd_nowarmup(event):
                         parse_mode='html')
 
 
-@main_bot.on(events.NewMessage(pattern=r'^/warmup(?:@[\w_]+)?(?:\s+(\w+))?$'))
+@main_bot.on(events.NewMessage(pattern=r'^/warmup(?:@[\w_]+)?(?:\s+(@?[\w_]+))?$'))
 async def cmd_warmup(event):
-    """Re-enable the warmup ramp. Mirror of /nowarmup."""
+    """Re-enable the warmup ramp. Mirror of /nowarmup.
+    - /warmup                    -> your own accounts
+    - /warmup <userid|@username> -> that user's accounts (admin only)
+    - /warmup all                -> re-enable globally (admin only)"""
     uid = event.sender_id
-    arg = (event.pattern_match.group(1) or '').strip().lower()
-    if arg == 'all':
+    arg = (event.pattern_match.group(1) or '').strip()
+    if arg.lower() == 'all':
         if not is_admin(uid):
             await event.respond("⚠️ Admins only. Use <code>/warmup</code> (no argument) for your own accounts.",
                                 parse_mode='html')
@@ -10770,6 +10790,21 @@ async def cmd_warmup(event):
         await event.respond("✅ Warmup <b>re-enabled globally</b> (new accounts ramp up gradually over "
                             f"{WARMUP_DAYS:g} day(s)).", parse_mode='html')
         return
+    # Target a specific user (admin only)
+    if arg:
+        if not is_admin(uid):
+            await event.respond("⚠️ Only admins can change warmup for another user.", parse_mode='html')
+            return
+        target_id = await resolve_target_user_id(arg, event.client)
+        if not target_id:
+            await event.respond("❌ User not found. Use a numeric id or @username.")
+            return
+        res = await db_call(accounts_col.update_many, {'owner_id': int(target_id)}, {'$unset': {'skip_warmup': ''}})
+        n = getattr(res, 'modified_count', 0)
+        await event.respond(f"✅ Warmup re-enabled for user <code>{target_id}</code>'s <b>{n}</b> account(s).",
+                            parse_mode='html')
+        return
+    # Own accounts (any user)
     res = await db_call(accounts_col.update_many, {'owner_id': uid}, {'$unset': {'skip_warmup': ''}})
     n = getattr(res, 'modified_count', 0)
     await event.respond(f"✅ Warmup re-enabled for your <b>{n}</b> account(s).", parse_mode='html')
