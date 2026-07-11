@@ -216,6 +216,21 @@ def get_effective_target_per_hour():
         v = DEFAULT_TARGET_PER_HOUR
     return max(1, min(HARD_MAX_TARGET_PER_HOUR, v))
 
+
+def get_user_target_per_hour(user):
+    """Per-USER send frequency if an admin set one (via /frequency), else the global
+    default. Reads the already-loaded user doc first (no extra DB call in the hot
+    loop), falling back to the cached global. Clamped to [1, HARD_MAX_TARGET_PER_HOUR]."""
+    try:
+        v = (user or {}).get('freq_per_hour')
+        if v is not None:
+            v = int(v)
+            if v >= 1:   # a valid override; 0/negative/missing -> global default
+                return min(HARD_MAX_TARGET_PER_HOUR, v)
+    except Exception:
+        pass
+    return get_effective_target_per_hour()
+
 def live_logs_enabled():
     """Live per-send logging toggle (admin, runtime). Falls back to LIVE_SEND_LOGS env."""
     return bool(get_global_setting('live_send_logs', LIVE_SEND_LOGS))
@@ -2424,7 +2439,7 @@ async def run_forwarding_loop(user_id, account_id):
                 # so each round targets target_cycle/K to keep per-group freq = target.
                 n_groups = len(groups_to_forward)
                 est_round_send = n_groups * msg_delay  # seconds (approx; msg_delay dominates)
-                target_per_hour = await db_call(get_effective_target_per_hour)
+                target_per_hour = await db_call(get_user_target_per_hour, user)
                 target_cycle = (3600.0 / target_per_hour) / rotation_buckets
                 round_delay = max(TARGET_MIN_CYCLE_FLOOR, int(target_cycle - est_round_send))
                 full_pass = rotation_buckets * (est_round_send + round_delay)
@@ -4454,11 +4469,11 @@ async def cmd_broadcast(event):
 # The old per-process snapshot handler was removed to avoid a duplicate double-reply.
 
 
-@main_bot.on(events.NewMessage(pattern=r'^/frequency(?:@[\w_]+)?\s+(\d+)$'))
 @main_bot.on(events.NewMessage(pattern=r'^/freq(?:@[\w_]+)?\s+(\d+)$'))
 async def cmd_freq(event):
-    """ADMIN ONLY. Set the GLOBAL per-group send frequency (times/hour) for all
-    users. Range 1..HARD_MAX_TARGET_PER_HOUR (default max 10). /freq = /frequency."""
+    """ADMIN ONLY. Set the GLOBAL DEFAULT per-group send frequency (times/hour) for
+    users WITHOUT a per-user override. Range 1..HARD_MAX_TARGET_PER_HOUR.
+    Per-user override: /frequency <userid|@username> <n>."""
     uid = event.sender_id
     if not is_admin(uid):
         await event.respond("Frequency is managed by admin.")
@@ -4473,6 +4488,40 @@ async def cmd_freq(event):
         "Auto-adjusts each account's cycle delay by its group count. "
         "Takes effect within ~30s + the current round."
     )
+
+
+@main_bot.on(events.NewMessage(pattern=r'^/frequency(?:@[\w_]+)?\s+(@?\w+)\s+(\d+)$'))
+async def cmd_frequency(event):
+    """ADMIN ONLY. Set a SPECIFIC user's per-group send frequency (times/hour),
+    overriding the global default for that user's accounts only.
+      /frequency 123456 5     -> that user's groups get ~5/hr
+      /frequency @user 0      -> reset that user back to the global default
+    Applies within ~1 round (no restart)."""
+    uid = event.sender_id
+    if not is_admin(uid):
+        await event.respond("Frequency is managed by admin.")
+        return
+    raw_target = event.pattern_match.group(1)
+    val = int(event.pattern_match.group(2))
+    if val != 0 and (val < 1 or val > HARD_MAX_TARGET_PER_HOUR):
+        await event.respond(f"Usage: /frequency <userid|@username> <1-{HARD_MAX_TARGET_PER_HOUR}>  "
+                            "(or 0 to reset to the global default)")
+        return
+    target_id = await resolve_target_user_id(raw_target, event.client)
+    if not target_id:
+        await event.respond("❌ User not found. Use a numeric id or @username.")
+        return
+    if val == 0:
+        await db_call(uupdate, {'user_id': int(target_id)}, {'$unset': {'freq_per_hour': ''}})
+        await event.respond(f"🎯 Frequency for <code>{target_id}</code> reset to the global default "
+                            f"({get_effective_target_per_hour()}/hr).", parse_mode='html')
+        return
+    await db_call(uupdate, {'user_id': int(target_id)}, {'$set': {'freq_per_hour': val}}, upsert=True)
+    await event.respond(
+        f"🎯 Frequency for <code>{target_id}</code> set to ~{val}/hour per group "
+        "(this user only).\n\n<i>Applies to their accounts within ~1 round. "
+        "Global default (/freq) is unchanged.</i>",
+        parse_mode='html')
 
 
 # /add command removed per user request (use dashboard Add Account button)
