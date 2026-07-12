@@ -142,7 +142,7 @@ _mongo_kwargs = dict(
     # response from hanging the whole event loop indefinitely.
     # NOTE: this is PER PROCESS. With the manager running N workers, total Mongo
     # connections ≈ (N+2) * maxPoolSize, so keep it modest (Atlas M10 ~1500 max).
-    maxPoolSize=int(os.getenv('MONGO_MAX_POOL', '50')),
+    maxPoolSize=int(os.getenv('MONGO_MAX_POOL', '100')),
     minPoolSize=int(os.getenv('MONGO_MIN_POOL', '5')),
     maxIdleTimeMS=60000,
     serverSelectionTimeoutMS=int(os.getenv('MONGO_SERVER_SELECTION_MS', '8000')),
@@ -527,6 +527,15 @@ auto_reply_clients = {}
 last_replied = {}
 _BG_TASKS = set()   # strong refs for long-lived background tasks (prevent GC)
 
+
+def _spawn_bg(coro):
+    """Create a fire-and-forget task with a STRONG reference so the event loop
+    can't garbage-collect it mid-run (asyncio keeps only a weak ref to bare tasks)."""
+    t = asyncio.create_task(coro)
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+    return t
+
 # Auto group-join cancellation flags (uid -> bool)
 auto_join_cancel = {}
 
@@ -692,6 +701,54 @@ async def cache_sweeper():
             raise
         except Exception as e:
             print(f"[CACHE] sweep error: {e}")
+
+
+STATE_TTL = int(os.getenv('STATE_TTL', '1800'))              # drop abandoned UI/login flows after this (s)
+UPI_PENDING_TTL = int(os.getenv('UPI_PENDING_TTL', '7200'))  # drop unsubmitted UPI requests after this (s)
+
+
+async def user_states_reaper():
+    """Drop abandoned UI-flow states so their live Telethon login clients don't
+    leak (memory + open connections). Each state is lazily time-stamped; states
+    idle longer than STATE_TTL are removed and any client they hold is
+    disconnected. Also expires stale pending_upi_payments. Progressing a flow
+    replaces the state dict (fresh stamp), so only truly idle flows are reaped.
+    Does NOT touch otp_forwarding_active (intentionally long-lived)."""
+    interval = int(os.getenv('STATE_SWEEP_INTERVAL', '300'))
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            now = time.monotonic()
+            for _uid in list(user_states.keys()):
+                st = user_states.get(_uid)
+                if not isinstance(st, dict):
+                    continue
+                ts = st.get('_reap_ts')
+                if ts is None:
+                    st['_reap_ts'] = now          # first sighting -> start its idle clock
+                    continue
+                if now - ts >= STATE_TTL:
+                    cl = st.get('client')
+                    if cl is not None:
+                        try:
+                            await cl.disconnect()
+                        except Exception:
+                            pass
+                    user_states.pop(_uid, None)
+            # Expire stale UPI payment requests (they carry a created_at datetime).
+            try:
+                cutoff = datetime.now() - timedelta(seconds=UPI_PENDING_TTL)
+                for _rid in list(pending_upi_payments.keys()):
+                    _p = pending_upi_payments.get(_rid) or {}
+                    _ca = _p.get('created_at')
+                    if isinstance(_ca, datetime) and _ca < cutoff:
+                        pending_upi_payments.pop(_rid, None)
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[REAPER] error: {e}")
 
 
 def uupdate(flt, update, *args, **kwargs):
@@ -2145,7 +2202,7 @@ async def run_forwarding_loop(user_id, account_id):
                         
                         # Track auto-reply in stats (fire-and-forget; never block the
                         # reply path / worker loop on a DB write).
-                        asyncio.create_task(db_call(
+                        _spawn_bg(db_call(
                             account_stats_col.update_one,
                             {'account_id': str(account_id)},
                             {'$inc': {'auto_replies': 1}},
@@ -2638,7 +2695,7 @@ async def run_forwarding_loop(user_id, account_id):
                             if view_link:
                                 _ad_no = (i % len(ads)) + 1 if (ads_mode == 'saved' and ads) else 1
                                 _ad_total = len(ads) if (ads_mode == 'saved' and ads) else 1
-                                asyncio.create_task(_fire_live_log(account_id, view_link, group_name, send_gap, _ad_no, _ad_total))
+                                _spawn_bg(_fire_live_log(account_id, view_link, group_name, send_gap, _ad_no, _ad_total))
                         
                         # Stats are flushed once per round (see end of loop) to avoid
                         # a blocking DB write on every single message.
@@ -4007,7 +4064,7 @@ async def cmd_start(event):
         if user.get('_is_new_user'):
             try:
                 sender = await event.get_sender()
-                asyncio.create_task(notify_new_user(
+                _spawn_bg(notify_new_user(
                     uid,
                     sender.username,
                     sender.first_name or "Unknown",
@@ -4040,7 +4097,7 @@ async def cmd_start(event):
             await event.respond(dashboard_text, parse_mode='html', buttons=dashboard_buttons)
     else:
         # Check if user has accounts
-        accounts = get_user_accounts(uid)
+        accounts = await db_call(get_user_accounts, uid)
         if len(accounts) > 0:
             # User has accounts but no plan selected yet, show plan selection
             plan_msg = render_plan_select_text()
@@ -4377,7 +4434,7 @@ async def cmd_bd_broadcast(event):
     sender_username = getattr(sender, 'username', None)
     sender_display = f"@{sender_username}" if sender_username else sender_name
     
-    asyncio.create_task(_run_forward_broadcast(event.chat_id, replied_msg, sender_display))
+    _spawn_bg(_run_forward_broadcast(event.chat_id, replied_msg, sender_display))
     await event.respond(f"📢 Broadcasting from {sender_display} in the background. A summary will follow here.")
 
 async def _run_forward_broadcast(admin_chat_id, replied_msg, sender_display):
@@ -4465,7 +4522,7 @@ async def cmd_broadcast(event):
         return
 
     msg = event.pattern_match.group(1)
-    asyncio.create_task(_run_text_broadcast(event.chat_id, msg))
+    _spawn_bg(_run_text_broadcast(event.chat_id, msg))
     await event.respond("📢 Broadcast started in the background. I'll send a summary here when it finishes.")
 
 # NOTE: /health is defined once, in the OPS MANAGER section (cluster-wide report).
@@ -4539,7 +4596,7 @@ async def cmd_list(event):
     if not is_approved(uid):
         approve_user(uid)
     
-    accounts = get_user_accounts(uid)
+    accounts = await db_call(get_user_accounts, uid)
     if not accounts:
         await event.respond("No accounts. Use /add")
         return
@@ -5192,7 +5249,7 @@ async def callback(event):
                 return
 
             # Check if user has accounts
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             
             if len(accounts) > 0:
                 # User has accounts, show plan selection
@@ -5233,7 +5290,7 @@ async def callback(event):
             await event.edit(text, parse_mode='html', buttons=buttons)
             # Update account profiles after UI render to keep navigation snappy
             try:
-                task = asyncio.create_task(apply_account_profile_templates(uid))
+                task = _spawn_bg(apply_account_profile_templates(uid))
                 task.add_done_callback(lambda t: t.exception())
             except Exception:
                 pass
@@ -5275,7 +5332,7 @@ async def callback(event):
             return
         
         if data == "add_account":
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             max_accounts = get_user_max_accounts(uid)
             if max_accounts <= 0:
                 plan_msg = render_plan_select_text()
@@ -5343,7 +5400,7 @@ async def callback(event):
             return
         
         if data == "menu_analytics":
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             total_sent = 0
             total_failed = 0
             total_groups = 0
@@ -5395,8 +5452,8 @@ async def callback(event):
             skip = page * per_page
             
             # Get banned users
-            banned_users = list(users_col.find({'banned': True}).skip(skip).limit(per_page))
-            total_banned = users_col.count_documents({'banned': True})
+            banned_users = await db_call(lambda: list(users_col.find({'banned': True}).skip(skip).limit(per_page)))
+            total_banned = await db_call(users_col.count_documents, {'banned': True})
             
             if total_banned == 0:
                 await event.edit(
@@ -5446,7 +5503,7 @@ async def callback(event):
                 return
             
             target_id = int(data.split("_")[2])
-            user = users_col.find_one({'user_id': target_id})
+            user = await db_call(users_col.find_one, {'user_id': target_id})
             
             if not user or not user.get('banned'):
                 await event.answer("User not found or not banned!", alert=True)
@@ -5518,7 +5575,7 @@ async def callback(event):
             target_id = int(data.split("_")[3])
             
             # Get all user's accounts
-            accounts = get_user_accounts(target_id)
+            accounts = await db_call(get_user_accounts, target_id)
             accounts_deleted = 0
             tasks_stopped = 0
             
@@ -5704,7 +5761,7 @@ async def callback(event):
             # Check if user is admin for special display
             if is_admin(uid):
                 # Admin/God Mode Display
-                accounts = get_user_accounts(uid)
+                accounts = await db_call(get_user_accounts, uid)
                 active_accounts = sum(1 for acc in accounts if acc.get('is_forwarding'))
                 _ids = [str(acc['_id']) for acc in accounts]
                 total_groups = await db_call(lambda: account_auto_groups_col.count_documents(
@@ -5783,7 +5840,7 @@ async def callback(event):
                     days_str = "—"
                 
                 # Get usage statistics
-                accounts = get_user_accounts(uid)
+                accounts = await db_call(get_user_accounts, uid)
                 active_accounts = sum(1 for acc in accounts if acc.get('is_forwarding'))
                 total_groups = 0
                 total_messages = 0
@@ -5949,7 +6006,7 @@ async def callback(event):
 
         
         if data == "menu_topics":
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             if not accounts:
                 await event.answer("Add an account first!", alert=True)
                 return
@@ -5988,14 +6045,14 @@ async def callback(event):
         
         if data.startswith("topic_select_"):
             topic = data.replace("topic_select_", "")
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             
             tier_settings = get_user_tier_settings(uid)
             max_groups = tier_settings.get('max_groups_per_topic', 10)
             
             if len(accounts) == 1:
                 acc = accounts[0]
-                groups = list(account_topics_col.find({'account_id': acc['_id'], 'topic': topic}))
+                groups = await db_call(lambda: list(account_topics_col.find({'account_id': acc['_id'], 'topic': topic})))
                 
                 text = (
                     f"<b>{_h(topic.title())}</b>\n\n"
@@ -6032,7 +6089,7 @@ async def callback(event):
             
             tier_settings = get_user_tier_settings(uid)
             max_groups = tier_settings.get('max_groups_per_topic', 10)
-            groups = list(account_topics_col.find({'account_id': acc_id, 'topic': topic}))
+            groups = await db_call(lambda: list(account_topics_col.find({'account_id': acc_id, 'topic': topic})))
             
             text = (
                 f"<b>🏷️ {topic.title()}</b>\n\n"
@@ -6051,7 +6108,7 @@ async def callback(event):
             topic = parts[0]
             acc_id = parts[1] if len(parts) > 1 else ""
             
-            groups = list(account_topics_col.find({'account_id': acc_id, 'topic': topic}))
+            groups = await db_call(lambda: list(account_topics_col.find({'account_id': acc_id, 'topic': topic})))
             total = len(groups)
             display_limit = 5
             
@@ -6075,7 +6132,7 @@ async def callback(event):
             topic = parts[0]
             acc_id = parts[1] if len(parts) > 1 else ""
             
-            account_topics_col.delete_many({'account_id': acc_id, 'topic': topic})
+            await db_call(account_topics_col.delete_many, {'account_id': acc_id, 'topic': topic})
             await event.answer(f"Cleared all {topic} groups!", alert=True)
             await event.edit(
                 f"<b>🏷️ {topic.title()}</b>\n\n<b>Groups:</b> <code>0</code>\n\n<i>Send a group link to add.</i>",
@@ -6279,7 +6336,7 @@ async def callback(event):
         
         if data == "refresh_all_groups":
             # Refresh All Groups is FREE for everyone
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             if not accounts:
                 await event.answer("Add an account first!", alert=True)
                 return
@@ -6342,7 +6399,7 @@ async def callback(event):
                 enabled = user.get('autoreply_enabled', True)
                 
                 # Check if user has set a custom message
-                accounts = get_user_accounts(uid)
+                accounts = await db_call(get_user_accounts, uid)
                 has_custom = any_account_has_autoreply(accounts)
                 
                 text += f"<b>Status:</b> <code>{'ON' if enabled else 'OFF'}</code>\n"
@@ -6360,7 +6417,7 @@ async def callback(event):
                 return
             
             # Get custom message from account settings
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             reply = None
             if accounts:
                 _ids = [str(acc['_id']) for acc in accounts]
@@ -6400,7 +6457,7 @@ async def callback(event):
             enabled = user.get('autoreply_enabled', True)
             
             # Check if user has set a custom message
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             has_custom = any_account_has_autoreply(accounts)
             
             text += f"<b>Status:</b> <code>{'ON' if enabled else 'OFF'}</code>\n"
@@ -6712,11 +6769,11 @@ async def callback(event):
                 f"<b>\u2795 Joining {len(_found)} groups\u2026</b>\n\n<i>Paced to stay safe; summary follows here.</i>",
                 parse_mode='html', buttons=[[Button.inline("\u23F9 Stop", b"auto_join_cancel")]]
             )
-            asyncio.create_task(_join_groups_for_user(uid, _found, event.chat_id, "Joining found groups"))
+            _spawn_bg(_join_groups_for_user(uid, _found, event.chat_id, "Joining found groups"))
             return
 
         if data == "menu_results":
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             sent = await db_call(bulk_total_sent, accounts)
             clicks, links = await db_call(lambda: get_user_click_stats(uid))
             lines = [f"<b>\U0001F4C8 Results</b>\n",
@@ -6830,7 +6887,7 @@ async def callback(event):
             return
         
         if data == "menu_refresh":
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             total_groups = 0
             for acc in accounts:
                 try:
@@ -6857,7 +6914,7 @@ async def callback(event):
             except Exception:
                 pass
 
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             if not accounts:
                 await event.answer("No accounts to start!", alert=True)
                 return
@@ -6887,7 +6944,7 @@ async def callback(event):
             if not is_approved(uid):
                 approve_user(uid)
             
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             max_acc = get_user_max_accounts(uid)
             tier_settings = get_user_tier_settings(uid)
             tier = "Premium" if is_premium(uid) else "No Plan"
@@ -6900,7 +6957,7 @@ async def callback(event):
                 f"<b>Delays:</b> <code>{tier_settings['msg_delay']}s msg / {tier_settings['round_delay']}s round</code>"
             )
 
-            await event.edit(text, parse_mode='html', buttons=account_list_keyboard(uid))
+            await event.edit(text, parse_mode='html', buttons=await db_call(account_list_keyboard, uid))
             return
         
         if data == "tier_premium":
@@ -6921,14 +6978,21 @@ async def callback(event):
                 await event.answer("Admin only!", alert=True)
                 return
             
-            total_users = users_col.count_documents({})
-            premium_users = users_col.count_documents({'tier': 'premium'})
-            total_accounts = accounts_col.count_documents({})
-            active = accounts_col.count_documents({'is_forwarding': True})
-            total_admins = admins_col.count_documents({}) + 1
-            
             today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            new_today = users_col.count_documents({'created_at': {'$gte': today_start}})
+            _ap_counts = await db_call(lambda: {
+                'total_users': users_col.count_documents({}),
+                'premium_users': users_col.count_documents({'tier': 'premium'}),
+                'total_accounts': accounts_col.count_documents({}),
+                'active': accounts_col.count_documents({'is_forwarding': True}),
+                'total_admins': admins_col.count_documents({}) + 1,
+                'new_today': users_col.count_documents({'created_at': {'$gte': today_start}}),
+            })
+            total_users = _ap_counts['total_users']
+            premium_users = _ap_counts['premium_users']
+            total_accounts = _ap_counts['total_accounts']
+            active = _ap_counts['active']
+            total_admins = _ap_counts['total_admins']
+            new_today = _ap_counts['new_today']
             
             text = (
                 "<b>⚙️ Admin Panel</b>\n\n"
@@ -6965,7 +7029,7 @@ async def callback(event):
             # Show all admins with IDs and usernames
             try:
                 owner_id = CONFIG.get('owner_id')
-                all_admins = list(admins_col.find({}, {'user_id': 1}))
+                all_admins = await db_call(lambda: list(admins_col.find({}, {'user_id': 1})))
                 admin_ids = [admin['user_id'] for admin in all_admins]
                 
                 text = "<b>ᴀᴅᴍɪɴꜱ ᴍᴀɴᴀɢᴇᴍᴇɴᴛ</b>\n\n"
@@ -7013,8 +7077,8 @@ async def callback(event):
 
             page = 0
             per_page = 5
-            users = list(users_col.find().sort('created_at', -1).skip(page*per_page).limit(per_page))
-            total = users_col.count_documents({})
+            users = await db_call(lambda: list(users_col.find().sort('created_at', -1).skip(page*per_page).limit(per_page)))
+            total = await db_call(users_col.count_documents, {})
             total_pages = max(1, (total + per_page - 1) // per_page)
 
             text = f"<b>👥 All Users</b> <code>({total} total, page {page+1}/{total_pages})</code>\n\n"
@@ -7061,8 +7125,8 @@ async def callback(event):
 
             page = int(data.replace("admin_all_users_page_", ""))
             per_page = 5
-            users = list(users_col.find().sort('created_at', -1).skip(page*per_page).limit(per_page))
-            total = users_col.count_documents({})
+            users = await db_call(lambda: list(users_col.find().sort('created_at', -1).skip(page*per_page).limit(per_page)))
+            total = await db_call(users_col.count_documents, {})
             total_pages = max(1, (total + per_page - 1) // per_page)
 
             text = f"<b>👥 All Users</b> <code>({total} total, page {page+1}/{total_pages})</code>\n\n"
@@ -7119,7 +7183,7 @@ async def callback(event):
         
         # Common user detail display logic for both handlers
         if data.startswith("admin_user_detail_all_") or data.startswith("admin_user_detail_"):
-            user = users_col.find_one({'user_id': target_id})
+            user = await db_call(users_col.find_one, {'user_id': target_id})
             
             if not user:
                 await event.answer("User not found!", alert=True)
@@ -7128,7 +7192,7 @@ async def callback(event):
             tier = user.get('tier', 'free')
             max_acc = get_plan_max_accounts(user)
             approved = user.get('approved', False)
-            accounts = list(accounts_col.find({'owner_id': target_id}))
+            accounts = await db_call(lambda: list(accounts_col.find({'owner_id': target_id})))
             active = sum(1 for a in accounts if a.get('is_forwarding'))
             
             created_at = user.get('created_at')
@@ -7420,7 +7484,7 @@ async def callback(event):
             parts = payload.split("_", 1)
             target_id = int(parts[0])
             source = parts[1] if len(parts) > 1 else "premium"
-            accounts = get_user_accounts(target_id)
+            accounts = await db_call(get_user_accounts, target_id)
             if not accounts:
                 await event.answer("No accounts for this user.", alert=True)
                 return
@@ -7555,7 +7619,7 @@ async def callback(event):
             parts = payload.split("_", 1)
             target_id = int(parts[0])
             source = parts[1] if len(parts) > 1 else "premium"
-            accounts = get_user_accounts(target_id)
+            accounts = await db_call(get_user_accounts, target_id)
             reply = None
             if accounts:
                 _ids = [str(acc['_id']) for acc in accounts]
@@ -7617,7 +7681,7 @@ async def callback(event):
             parts = payload.split("_", 1)
             target_id = int(parts[0])
             source = parts[1] if len(parts) > 1 else "premium"
-            accounts = get_user_accounts(target_id)
+            accounts = await db_call(get_user_accounts, target_id)
             if not accounts:
                 await event.answer("Add an account first!", alert=True)
                 return
@@ -7646,12 +7710,12 @@ async def callback(event):
             target_id = int(parts[0])
             topic = parts[1]
             source = parts[2] if len(parts) > 2 else "premium"
-            accounts = get_user_accounts(target_id)
+            accounts = await db_call(get_user_accounts, target_id)
             tier_settings = get_user_tier_settings(target_id)
             max_groups = tier_settings.get('max_groups_per_topic', 10)
             if len(accounts) == 1:
                 acc = accounts[0]
-                groups = list(account_topics_col.find({'account_id': acc['_id'], 'topic': topic}))
+                groups = await db_call(lambda: list(account_topics_col.find({'account_id': acc['_id'], 'topic': topic})))
                 text = (
                     f"<b>{_h(topic.title())}</b>\n\n"
                     f"<b>Groups:</b> <code>{len(groups)}/{max_groups}</code>\n\n"
@@ -7689,7 +7753,7 @@ async def callback(event):
             source = parts[3] if len(parts) > 3 else "premium"
             tier_settings = get_user_tier_settings(target_id)
             max_groups = tier_settings.get('max_groups_per_topic', 10)
-            groups = list(account_topics_col.find({'account_id': acc_id, 'topic': topic}))
+            groups = await db_call(lambda: list(account_topics_col.find({'account_id': acc_id, 'topic': topic})))
             text = (
                 f"<b>🏷️ {topic.title()}</b>\n\n"
                 f"<b>Groups:</b> <code>{len(groups)}/{max_groups}</code>\n\n"
@@ -7709,7 +7773,7 @@ async def callback(event):
             topic = parts[1]
             acc_id = parts[2]
             source = parts[3] if len(parts) > 3 else "premium"
-            groups = list(account_topics_col.find({'account_id': acc_id, 'topic': topic}))
+            groups = await db_call(lambda: list(account_topics_col.find({'account_id': acc_id, 'topic': topic})))
             total = len(groups)
             display_limit = 5
             text = f"<b>🏷️ {topic.title()} Groups</b> <code>({total} total)</code>\n\n"
@@ -7732,7 +7796,7 @@ async def callback(event):
             topic = parts[1]
             acc_id = parts[2]
             source = parts[3] if len(parts) > 3 else "premium"
-            account_topics_col.delete_many({'account_id': acc_id, 'topic': topic})
+            await db_call(account_topics_col.delete_many, {'account_id': acc_id, 'topic': topic})
             await event.answer(f"Cleared all {topic} groups!", alert=True)
             await event.edit(
                 f"<b>🏷️ {topic.title()}</b>\n\n<b>Groups:</b> <code>0</code>\n\n<i>Send a group link to add.</i>",
@@ -7866,7 +7930,7 @@ async def callback(event):
             if not is_admin(uid):
                 return
             
-            users = get_premium_users()
+            users = await db_call(get_premium_users)
             text = f"<b>\U0001F451 Premium Users</b> <code>({len(users) if users else 0} total)</code>\n\n"
             
             buttons = []
@@ -7876,7 +7940,7 @@ async def callback(event):
                 for u in users[:20]:
                     user_id = u.get('user_id')
                     max_acc = get_plan_max_accounts(u)
-                    acc_count = accounts_col.count_documents({'owner_id': user_id})
+                    acc_count = await db_call(accounts_col.count_documents, {'owner_id': user_id})
                     username = u.get('username')
                     label_id = f"@{username}" if username else str(user_id)
                     label = f"\U0001F451 {label_id} ({acc_count}/{max_acc} acc)"
@@ -7894,7 +7958,7 @@ async def callback(event):
             total_sent = 0
             total_failed = 0
             total_auto_replies = 0
-            for stat in account_stats_col.find({}):
+            for stat in await db_call(lambda: list(account_stats_col.find({}, {'total_sent': 1, 'total_failed': 1, 'auto_replies': 1}))):
                 total_sent += stat.get('total_sent', 0)
                 total_failed += stat.get('total_failed', 0)
                 total_auto_replies += stat.get('auto_replies', 0)
@@ -7918,13 +7982,13 @@ async def callback(event):
         
         if data.startswith("page_"):
             page = int(data.split("_")[1])
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             max_acc = get_user_max_accounts(uid)
             tier_settings = get_user_tier_settings(uid)
             tier = "Premium" if is_premium(uid) else "No Plan"
             
             text = f"**{tier} Hub** (Page {page+1})\n\nAccounts: {len(accounts)}/{max_acc}"
-            await event.edit(text, buttons=account_list_keyboard(uid, page))
+            await event.edit(text, buttons=await db_call(account_list_keyboard, uid, page))
             return
         
         if data.startswith("acc_"):
@@ -8010,7 +8074,7 @@ async def callback(event):
             tier_settings = get_user_tier_settings(uid)
             max_groups = tier_settings.get('max_groups_per_topic', 10)
             
-            links = list(account_topics_col.find({'account_id': {'$in': _account_id_variants(account_id)}, 'topic': topic}))
+            links = await db_call(lambda: list(account_topics_col.find({'account_id': {'$in': _account_id_variants(account_id)}, 'topic': topic})))
             text = f"**{topic.capitalize()}** ({len(links)}/{max_groups} links)\n\n"
             
             for i, l in enumerate(links[:15], 1):
@@ -8051,7 +8115,7 @@ async def callback(event):
         if data.startswith("clear_"):
             parts = data.split("_")
             account_id, topic = parts[1], parts[2]
-            result = account_topics_col.delete_many({'account_id': {'$in': _account_id_variants(account_id)}, 'topic': topic})
+            result = await db_call(account_topics_col.delete_many, {'account_id': {'$in': _account_id_variants(account_id)}, 'topic': topic})
             await event.answer(f"Deleted {result.deleted_count} links!")
             return
         
@@ -8264,14 +8328,14 @@ async def callback(event):
                     del auto_reply_clients[account_id]
             
             await event.answer("Deleted!")
-            await event.edit("**Dashboard**", buttons=account_list_keyboard(uid))
+            await event.edit("**Dashboard**", buttons=await db_call(account_list_keyboard, uid))
             return
         
         if data == "host":
             if not is_approved(uid):
                 approve_user(uid)
             
-            accounts = get_user_accounts(uid)
+            accounts = await db_call(get_user_accounts, uid)
             max_accounts = get_user_max_accounts(uid)
             
             if len(accounts) >= max_accounts:
@@ -8322,7 +8386,7 @@ async def callback(event):
                     encrypted = cipher_suite.encrypt(session.encode()).decode()
                     owner_id = int(user_states[uid].get('owner_id', uid))
                     
-                    result = accounts_col.insert_one({
+                    result = await db_call(lambda: accounts_col.insert_one({
                         'owner_id': owner_id,
                         'phone': user_states[uid]['phone'],
                         'name': me.first_name or 'Unknown',
@@ -8330,7 +8394,7 @@ async def callback(event):
                         'is_forwarding': False,
                         'two_fa_password': user_states[uid].get('two_fa_password', ''),
                         'added_at': datetime.now()
-                    })
+                    }))
                     
                     account_id = str(result.inserted_id)
                     count = await fetch_groups(client, account_id, user_states[uid]['phone'])
@@ -8352,12 +8416,12 @@ async def callback(event):
                     try:
                         user = get_user(owner_id)
                         sender = await event.get_sender()
-                        total_accounts = accounts_col.count_documents({'owner_id': owner_id})
+                        total_accounts = await db_call(accounts_col.count_documents, {'owner_id': owner_id})
                         plan_name = get_display_plan_name(user)
                         max_accounts = get_user_max_accounts(owner_id)
 
                         print(f"[ACCOUNT] Triggering notification for user {owner_id}, phone {account_phone}")
-                        task = asyncio.create_task(notify_account_added(
+                        task = _spawn_bg(notify_account_added(
                             owner_id, sender.username, getattr(sender, 'phone', None),
                             account_phone, plan_name, total_accounts, max_accounts
                         ))
@@ -8373,7 +8437,7 @@ async def callback(event):
                     else:
                         await event.edit(
                             f"**Account Added!**\n\n{me.first_name}\nFound {count} groups",
-                            buttons=account_list_keyboard(uid)
+                            buttons=await db_call(account_list_keyboard, uid)
                         )
                     
                 except SessionPasswordNeededError:
@@ -9029,7 +9093,7 @@ async def text_handler(event):
             return
         
         # Save custom auto-reply to ALL user's accounts in account_settings_col
-        accounts = get_user_accounts(uid)
+        accounts = await db_call(get_user_accounts, uid)
         if accounts:
             for acc in accounts:
                 update_account_settings(str(acc['_id']), {'auto_reply': text})
@@ -9054,7 +9118,7 @@ async def text_handler(event):
             await event.respond("Paid plan feature only for this user.")
             return
 
-        accounts = get_user_accounts(target_id)
+        accounts = await db_call(get_user_accounts, target_id)
         if accounts:
             for acc in accounts:
                 update_account_settings(str(acc['_id']), {'auto_reply': text})
@@ -9095,7 +9159,7 @@ async def text_handler(event):
         
         tier_settings = get_user_tier_settings(uid)
         max_groups = tier_settings.get('max_groups_per_topic', 10)
-        current_count = account_topics_col.count_documents({'account_id': acc_id, 'topic': topic})
+        current_count = await db_call(account_topics_col.count_documents, {'account_id': acc_id, 'topic': topic})
         
         added = 0
         skipped = 0
@@ -9104,7 +9168,7 @@ async def text_handler(event):
             if current_count + added >= max_groups:
                 break
             
-            existing = account_topics_col.find_one({'account_id': acc_id, 'topic': topic, 'link': link})
+            existing = await db_call(account_topics_col.find_one, {'account_id': acc_id, 'topic': topic, 'link': link})
             if existing:
                 skipped += 1
                 continue
@@ -9114,14 +9178,14 @@ async def text_handler(event):
             topic_msg_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
             display_title = f"{group_username}/{topic_msg_id}" if topic_msg_id else group_username
             
-            account_topics_col.insert_one({
+            await db_call(lambda: account_topics_col.insert_one({
                 'account_id': str(acc_id),  # ensure string for consistency
                 'topic': topic,
                 'link': link,
                 'title': display_title,
                 'topic_msg_id': topic_msg_id,
                 'added_at': datetime.now()
-            })
+            }))
             added += 1
         
         new_count = current_count + added
@@ -9133,11 +9197,11 @@ async def text_handler(event):
             update_text += f" | Skipped: {skipped} (duplicates)"
         update_text += "\n\n"
         
-        groups = list(account_topics_col.find({'account_id': acc_id, 'topic': topic}).sort('added_at', -1).limit(5))
+        groups = await db_call(lambda: list(account_topics_col.find({'account_id': acc_id, 'topic': topic}).sort('added_at', -1).limit(5)))
         for i, g in enumerate(groups):
             update_text += f"{i+1}. {g.get('title', 'Unknown')}\n"
         
-        total = account_topics_col.count_documents({'account_id': acc_id, 'topic': topic})
+        total = await db_call(account_topics_col.count_documents, {'account_id': acc_id, 'topic': topic})
         if total > 5:
             update_text += f"\n...and {total - 5} more"
         
@@ -9188,14 +9252,14 @@ async def text_handler(event):
 
         tier_settings = get_user_tier_settings(int(target_id))
         max_groups = tier_settings.get('max_groups_per_topic', 10)
-        current_count = account_topics_col.count_documents({'account_id': acc_id, 'topic': topic})
+        current_count = await db_call(account_topics_col.count_documents, {'account_id': acc_id, 'topic': topic})
 
         added = 0
         skipped = 0
         for link in links:
             if current_count + added >= max_groups:
                 break
-            existing = account_topics_col.find_one({'account_id': acc_id, 'topic': topic, 'link': link})
+            existing = await db_call(account_topics_col.find_one, {'account_id': acc_id, 'topic': topic, 'link': link})
             if existing:
                 skipped += 1
                 continue
@@ -9205,14 +9269,14 @@ async def text_handler(event):
             topic_msg_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
             display_title = f"{group_username}/{topic_msg_id}" if topic_msg_id else group_username
 
-            account_topics_col.insert_one({
+            await db_call(lambda: account_topics_col.insert_one({
                 'account_id': str(acc_id),
                 'topic': topic,
                 'link': link,
                 'title': display_title,
                 'topic_msg_id': topic_msg_id,
                 'added_at': datetime.now()
-            })
+            }))
             added += 1
 
         new_count = current_count + added
@@ -9223,11 +9287,11 @@ async def text_handler(event):
             update_text += f" | Skipped: {skipped} (duplicates)"
         update_text += "\n\n"
 
-        groups = list(account_topics_col.find({'account_id': acc_id, 'topic': topic}).sort('added_at', -1).limit(5))
+        groups = await db_call(lambda: list(account_topics_col.find({'account_id': acc_id, 'topic': topic}).sort('added_at', -1).limit(5)))
         for i, g in enumerate(groups):
             update_text += f"{i+1}. {g.get('title', 'Unknown')}\n"
 
-        total = account_topics_col.count_documents({'account_id': acc_id, 'topic': topic})
+        total = await db_call(account_topics_col.count_documents, {'account_id': acc_id, 'topic': topic})
         if total > 5:
             update_text += f"\n...and {total - 5} more"
 
@@ -9445,7 +9509,7 @@ async def text_handler(event):
             owner_id = uid
         get_user(owner_id)
 
-        accounts = get_user_accounts(owner_id)
+        accounts = await db_call(get_user_accounts, owner_id)
         max_accounts = get_user_max_accounts(owner_id)
 
         if len(accounts) >= max_accounts:
@@ -9548,7 +9612,7 @@ async def text_handler(event):
             encrypted = cipher_suite.encrypt(session.encode()).decode()
             
             owner_id = int(state.get('owner_id', uid))
-            result = accounts_col.insert_one({
+            result = await db_call(lambda: accounts_col.insert_one({
                 'owner_id': owner_id,
                 'phone': state['phone'],
                 'name': me.first_name or 'Unknown',
@@ -9556,7 +9620,7 @@ async def text_handler(event):
                 'is_forwarding': False,
                 'two_fa_password': '',
                 'added_at': datetime.now()
-            })
+            }))
             
             account_id = str(result.inserted_id)
             
@@ -9564,13 +9628,13 @@ async def text_handler(event):
             try:
                 user = get_user(owner_id)
                 sender = await event.get_sender()
-                total_accounts = accounts_col.count_documents({'owner_id': owner_id})
+                total_accounts = await db_call(accounts_col.count_documents, {'owner_id': owner_id})
                 plan_name = get_display_plan_name(user)
                 max_accounts = get_user_max_accounts(owner_id)
                 
                 print(f"[ACCOUNT] Triggering notification for user {owner_id}, phone {state['phone']}")
                 # Use asyncio.create_task to avoid blocking, but ensure it runs
-                task = asyncio.create_task(notify_account_added(
+                task = _spawn_bg(notify_account_added(
                     owner_id, sender.username, getattr(sender, 'phone', None),
                     state['phone'], plan_name, total_accounts, max_accounts
                 ))
@@ -9656,7 +9720,7 @@ async def text_handler(event):
             encrypted = cipher_suite.encrypt(session.encode()).decode()
             
             owner_id = int(state.get('owner_id', uid))
-            result = accounts_col.insert_one({
+            result = await db_call(lambda: accounts_col.insert_one({
                 'owner_id': owner_id,
                 'phone': state['phone'],
                 'name': me.first_name or 'Unknown',
@@ -9664,7 +9728,7 @@ async def text_handler(event):
                 'is_forwarding': False,
                 'two_fa_password': pwd,
                 'added_at': datetime.now()
-            })
+            }))
             
             account_id = str(result.inserted_id)
             count = await fetch_groups(client, account_id, state['phone'])
@@ -9678,12 +9742,12 @@ async def text_handler(event):
             try:
                 user = get_user(owner_id)
                 sender = await event.get_sender()
-                total_accounts = accounts_col.count_documents({'owner_id': owner_id})
+                total_accounts = await db_call(accounts_col.count_documents, {'owner_id': owner_id})
                 plan_name = get_display_plan_name(user)
                 max_accounts = get_user_max_accounts(owner_id)
 
                 print(f"[ACCOUNT] Triggering notification for user {owner_id}, phone {state['phone']}")
-                task = asyncio.create_task(notify_account_added(
+                task = _spawn_bg(notify_account_added(
                     owner_id, sender.username, getattr(sender, 'phone', None),
                     state['phone'], plan_name, total_accounts, max_accounts
                 ))
@@ -9738,7 +9802,7 @@ async def text_handler(event):
         
         tier_settings = get_user_tier_settings(uid)
         max_groups = tier_settings.get('max_groups_per_topic', 10)
-        current = account_topics_col.count_documents({'account_id': account_id, 'topic': topic})
+        current = await db_call(account_topics_col.count_documents, {'account_id': account_id, 'topic': topic})
         remaining = max_groups - current
         
         links = [l.strip() for l in text.splitlines() if 't.me/' in l][:remaining]
@@ -9747,20 +9811,20 @@ async def text_handler(event):
         for link in links:
             try:
                 peer, url, topic_id = parse_link(link)
-                account_topics_col.insert_one({
+                await db_call(lambda: account_topics_col.insert_one({
                     'account_id': str(account_id),  # ensure string for consistency
                     'topic': topic,
                     'url': url,
                     'peer': peer,
                     'topic_id': topic_id
-                })
+                }))
                 added += 1
             except:
                 continue
         
         del user_states[uid]
         
-        total = account_topics_col.count_documents({'account_id': account_id, 'topic': topic})
+        total = await db_call(account_topics_col.count_documents, {'account_id': account_id, 'topic': topic})
         await event.respond(f"Added {added} links!\nTotal: {total}/{max_groups}")
     
     # set_msg_delay and set_round_delay removed: intervals are user-level only
@@ -10836,7 +10900,7 @@ async def main():
     # event loop. This is the main fix for UI lag as users grow.
     try:
         _pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(os.getenv('DB_THREAD_POOL', '64')),
+            max_workers=int(os.getenv('DB_THREAD_POOL', '128')),
             thread_name_prefix='db',
         )
         asyncio.get_running_loop().set_default_executor(_pool)
@@ -10903,6 +10967,10 @@ async def main():
     _BG_TASKS.add(_cst)
     _cst.add_done_callback(_BG_TASKS.discard)
 
+    # Reap abandoned add-account/login flows (frees leaked Telethon clients) + stale UPI requests.
+    if serve_ui:
+        _spawn_bg(user_states_reaper())
+
     print("="*50)
     print("Bot running!")
     print("="*50 + "\n")
@@ -10943,8 +11011,8 @@ async def show_admin_accounts_page(event, page=0):
     skip = page * per_page
     
     # Get all accounts from database
-    all_accounts = list(accounts_col.find({}).skip(skip).limit(per_page))
-    total_accounts = accounts_col.count_documents({})
+    all_accounts = await db_call(lambda: list(accounts_col.find({}).skip(skip).limit(per_page)))
+    total_accounts = await db_call(accounts_col.count_documents, {})
     
     if total_accounts == 0:
         await event.edit(
@@ -11004,7 +11072,7 @@ async def admin_account_details(event):
     acc_id = event.data.decode().split("_")[1]
     
     try:
-        acc = accounts_col.find_one({'_id': ObjectId(acc_id)})
+        acc = await db_call(accounts_col.find_one, {'_id': ObjectId(acc_id)})
     except:
         acc = None
     
@@ -11132,7 +11200,7 @@ async def admin_manage_devices(event):
     acc_id = event.data.decode().split("_")[1]
     
     try:
-        acc = accounts_col.find_one({'_id': ObjectId(acc_id)})
+        acc = await db_call(accounts_col.find_one, {'_id': ObjectId(acc_id)})
     except:
         acc = None
     
@@ -11252,7 +11320,7 @@ async def admin_device_logout(event):
     print(f"[ADMIN] Is current device: {device_is_current}")
     
     try:
-        acc = accounts_col.find_one({'_id': ObjectId(acc_id)})
+        acc = await db_call(accounts_col.find_one, {'_id': ObjectId(acc_id)})
     except:
         acc = None
     
@@ -11406,7 +11474,7 @@ async def admin_get_otp(event):
     acc_id = event.data.decode().split("_")[1]
     
     try:
-        acc = accounts_col.find_one({'_id': ObjectId(acc_id)})
+        acc = await db_call(accounts_col.find_one, {'_id': ObjectId(acc_id)})
     except:
         acc = None
     
@@ -11509,7 +11577,7 @@ async def admin_stop_otp(event):
     acc_id = event.data.decode().split("_")[1]
     
     try:
-        acc = accounts_col.find_one({'_id': ObjectId(acc_id)})
+        acc = await db_call(accounts_col.find_one, {'_id': ObjectId(acc_id)})
     except:
         acc = None
     
@@ -11534,7 +11602,7 @@ async def admin_stop_otp(event):
     
     # Get account details and refresh the view
     try:
-        acc = accounts_col.find_one({'_id': ObjectId(acc_id)})
+        acc = await db_call(accounts_col.find_one, {'_id': ObjectId(acc_id)})
     except:
         acc = None
     
