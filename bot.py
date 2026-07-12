@@ -760,7 +760,7 @@ def get_user(user_id):
             'forwarding_mode': 'auto',
             'ads_mode': 'saved',
             'smart_rotation': False,
-            'toxic_prune': True,
+            'toxic_prune': False,
             'quiet_hours': quiet_default,
             'created_at': datetime.now(),
             '_is_new_user': True
@@ -1417,7 +1417,7 @@ HEALTH_PEERFLOOD_LIMIT = int(os.getenv('HEALTH_PEERFLOOD_LIMIT', '3'))
 # or they have heavy slow-mode (so the account wastes its cadence retrying). We
 # count strikes per (account, group) and, once a group crosses the threshold for
 # its reason, STOP sending to it for that account. Users can toggle this off.
-TOXIC_PRUNE_DEFAULT = os.getenv('TOXIC_PRUNE_DEFAULT', '1').strip().lower() in ('1', 'true', 'yes', 'on')
+TOXIC_PRUNE_DEFAULT = os.getenv('TOXIC_PRUNE_DEFAULT', '0').strip().lower() in ('1', 'true', 'yes', 'on')
 TOXIC_ADMIN_ONLY_STRIKES = int(os.getenv('TOXIC_ADMIN_ONLY_STRIKES', '2'))  # can't-write (admin-only)
 TOXIC_BAN_STRIKES = int(os.getenv('TOXIC_BAN_STRIKES', '1'))                # banned-on-post -> drop now
 TOXIC_SLOWMODE_SEC = int(os.getenv('TOXIC_SLOWMODE_SEC', '3600'))           # slow-mode >= this = "heavy"
@@ -1566,9 +1566,9 @@ def _is_auto_leave_enabled(user_id: int) -> bool:
     """User-level toggle for whether bot should auto-leave groups on permanent send failures."""
     try:
         doc = get_user_cached(int(user_id))
-        return bool(doc.get('auto_leave_groups', True))
+        return bool(doc.get('auto_leave_groups', False))
     except Exception:
-        return True
+        return False
 
 def _parse_time_24h(value: str):
     value = (value or "").strip()
@@ -2301,7 +2301,7 @@ async def run_forwarding_loop(user_id, account_id):
                         mode_display = fwd_mode.capitalize()
                     
                     # Get auto leave and auto reply status
-                    auto_leave = "✅ ON" if user_doc.get('auto_leave_groups', True) else "❌ OFF"
+                    auto_leave = "✅ ON" if user_doc.get('auto_leave_groups', False) else "❌ OFF"
                     auto_reply = "✅ ON" if user_doc.get('auto_reply_enabled', False) else "❌ OFF"
                     
                     log_msg = (
@@ -2459,6 +2459,7 @@ async def run_forwarding_loop(user_id, account_id):
                 stats_failed = 0
                 peerflood_hit = False
                 toxic_dropped = 0
+                needs_drop = 0   # groups the account can't post to (permanent) -> user should remove them
                 last_send_started_at = None
                 
                 for i, group in enumerate(groups_to_forward):
@@ -2651,7 +2652,7 @@ async def run_forwarding_loop(user_id, account_id):
                         await add_user_log(user_id, f"FloodWait {wait_time // 60}m in {group['title'][:20]}")
                         
                     except (ChannelPrivateError, ChatWriteForbiddenError, UserBannedInChannelError) as e:
-                        failed += 1
+                        needs_drop += 1   # account can't post here (private/admin-only/banned) -> user should drop it
                         entity_cache.pop(group_key, None)
                         await db_call(mark_group_failed, account_id, group_key, str(e))
                         print(f"[FORWARDING] Permanent fail {group['title']}: {type(e).__name__}")
@@ -2709,14 +2710,15 @@ async def run_forwarding_loop(user_id, account_id):
                         break
 
                     except Exception as e:
-                        failed += 1
                         entity_cache.pop(group_key, None)
                         error_str = str(e)
                         wait_match = re.search(r'wait of (\d+) seconds', error_str, re.IGNORECASE)
                         if wait_match:
+                            failed += 1   # transient rate-limit wait embedded in a generic error
                             wait_time = int(wait_match.group(1))
                             await db_call(set_flood_wait, account_id, group_key, group['title'], wait_time)
                         else:
+                            needs_drop += 1   # permanent send failure -> user should drop/remove this group
                             print(f"[FORWARDING] Error {group['title']}: {error_str[:50]}")
 
                             # Auto-leave on any non-flood send failure (only if enabled)
@@ -2747,13 +2749,14 @@ async def run_forwarding_loop(user_id, account_id):
                 _health_bump('sends', sent)
                 _health_bump('fails', stats_failed)
                 
-                print(f"[FORWARDING] Round complete. Sent: {sent}, Failed: {failed}, Skipped: {skipped}")
-                drop_note = f" | 🛡️ <b>Dropped:</b> <code>{toxic_dropped}</code>" if toxic_dropped else ""
+                print(f"[FORWARDING] Round complete. Sent: {sent}, Failed: {failed}, NeedsDrop: {needs_drop}, Skipped: {skipped}")
+                # "Auto-Dropped" = groups auto-removed by toxic-pruning (off by default).
+                drop_note = f" | 🛡️ <b>Auto-Dropped:</b> <code>{toxic_dropped}</code>" if toxic_dropped else ""
                 try:
-                    await send_log(account_id, f"<b>✅ Round {round_num} Completed</b>\n\n📤 <b>Sent:</b> <code>{sent}</code> | ❌ <b>Failed:</b> <code>{failed}</code> | ⏭ <b>Skipped:</b> <code>{skipped}</code>{drop_note}\n\n⏰ <b>Next Round:</b> <code>{round_delay}s</code>{freq_note}")
+                    await send_log(account_id, f"<b>✅ Round {round_num} Completed</b>\n\n📤 <b>Sent:</b> <code>{sent}</code> | ❌ <b>Failed:</b> <code>{failed}</code> | 🗑 <b>Needs Drop:</b> <code>{needs_drop}</code> | ⏭ <b>Skipped:</b> <code>{skipped}</code>{drop_note}\n\n⏰ <b>Next Round:</b> <code>{round_delay}s</code>{freq_note}")
                 except Exception:
                     pass
-                await add_user_log(user_id, f"Round: {sent} sent, {failed} failed, {skipped} skipped")
+                await add_user_log(user_id, f"Round: {sent} sent, {failed} failed, {needs_drop} needs-drop, {skipped} skipped")
                 
                 # Check if still forwarding before waiting for next round
                 if not acc.get('is_forwarding', False):
